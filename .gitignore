@@ -1,0 +1,14 @@
+# Node dependencies
+node_modules/
+
+# Local environment configuration and secrets
+.env
+.env.local
+
+# Debug and system files
+npm-debug.log*
+.DS_Store
+
+# IDE configurations
+.vscode/
+.idea/
