@@ -31,6 +31,7 @@ jobs:
 
     steps:
       # Step 1: Checkout the repository code
+      # Fetches all history and tags to enable proper versioning
       - name: Checkout code
         uses: actions/checkout@v4
 
@@ -52,6 +53,7 @@ jobs:
         run: echo "short=$(echo ${{ github.sha }} | cut -c1-7)" >> $GITHUB_OUTPUT
 
       # Step 4: Authenticate with Docker Hub
+      # Uses GitHub secrets for secure credential management
       - name: Log in to Docker Hub
         uses: docker/login-action@v3
         with:
@@ -59,6 +61,7 @@ jobs:
           password: ${{ secrets.DOCKER_PASSWORD }}
 
       # Step 5: Set up Docker Buildx for advanced build features
+      # Enables multi-platform builds and cache management
       - name: Set up Docker Buildx
         uses: docker/setup-buildx-action@v3
 
@@ -79,6 +82,7 @@ jobs:
           cache-to: type=registry,ref=${{ env.IMAGE_NAME }}:buildcache,mode=max
 
       # Step 7: Display deployment summary in GitHub Actions UI
+      # Renders markdown summary with deployment details for visibility
       - name: Deployment summary
         run: |
           echo "### Deployment Summary :rocket:" >> $GITHUB_STEP_SUMMARY
@@ -110,6 +114,7 @@ jobs:
           cd k8s/services/telemetry_backend/overlays/$BRANCH_NAME
 
           SHORT_SHA=$(echo ${{ github.sha }} | cut -c1-7)
+          # Update the newTag field in kustomization.yaml with the new image tag
           sed -i "s|newTag:.*|newTag: ${{ steps.env.outputs.environment }}-${SHORT_SHA}|g" kustomization.yaml
 
           git add kustomization.yaml
