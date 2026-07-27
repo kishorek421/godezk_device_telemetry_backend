@@ -15,7 +15,6 @@ on:
       - 'Dockerfile'
       - 'package*.json'
       - 'server.js'
-      - 'public/**'
       - '.github/workflows/build-telemetry_backend.yml'
   workflow_dispatch: # Allow manual trigger from GitHub UI
 
