@@ -12,7 +12,6 @@ on:
       - stage
     # Trigger on relevant paths to avoid unnecessary builds
     paths:
-      - 'services/telemetry_backend/**'
       - 'Dockerfile'
       - 'package*.json'
       - 'server.js'
