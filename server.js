@@ -1091,6 +1091,70 @@ app.get('/api/deep-analysis', async (req, res) => {
   }
 });
 
+// ── 9. Benchmark — frames per minute / day / week / month ─────────
+app.get('/api/benchmark', async (req, res) => {
+  try {
+    const minuteQuery = `
+      SELECT
+        to_char(date_trunc('minute', started_at), 'YYYY-MM-DD HH24:MI:00') AS time_bucket,
+        COUNT(*)::int AS frames
+      FROM workflow_org_executions
+      WHERE started_at IS NOT NULL AND started_at >= NOW() - INTERVAL '24 hours'
+      GROUP BY date_trunc('minute', started_at)
+      ORDER BY date_trunc('minute', started_at) ASC
+    `;
+
+    const dayQuery = `
+      SELECT
+        to_char(date_trunc('day', started_at), 'YYYY-MM-DD') AS time_bucket,
+        COUNT(*)::int AS frames
+      FROM workflow_org_executions
+      WHERE started_at IS NOT NULL AND started_at >= NOW() - INTERVAL '30 days'
+      GROUP BY date_trunc('day', started_at)
+      ORDER BY date_trunc('day', started_at) ASC
+    `;
+
+    const weekQuery = `
+      SELECT
+        to_char(date_trunc('week', started_at), 'YYYY-MM-DD') AS time_bucket,
+        COUNT(*)::int AS frames
+      FROM workflow_org_executions
+      WHERE started_at IS NOT NULL AND started_at >= NOW() - INTERVAL '12 weeks'
+      GROUP BY date_trunc('week', started_at)
+      ORDER BY date_trunc('week', started_at) ASC
+    `;
+
+    const monthQuery = `
+      SELECT
+        to_char(date_trunc('month', started_at), 'YYYY-MM') AS time_bucket,
+        COUNT(*)::int AS frames
+      FROM workflow_org_executions
+      WHERE started_at IS NOT NULL AND started_at >= NOW() - INTERVAL '12 months'
+      GROUP BY date_trunc('month', started_at)
+      ORDER BY date_trunc('month', started_at) ASC
+    `;
+
+    const [perMinute, perDay, perWeek, perMonth] = await Promise.all([
+      pool.query(minuteQuery),
+      pool.query(dayQuery),
+      pool.query(weekQuery),
+      pool.query(monthQuery),
+    ]);
+
+    res.json({
+      success: true,
+      perMinute: perMinute.rows,
+      perDay: perDay.rows,
+      perWeek: perWeek.rows,
+      perMonth: perMonth.rows,
+      generatedAt: new Date().toISOString(),
+    });
+  } catch (err) {
+    console.error('[Telemetry Backend] benchmark error:', err.message);
+    res.status(500).json({ success: false, error: err.message });
+  }
+});
+
 // ── Startup ──────────────────────────────────────────────────────
 async function start() {
   // Test DB connection
