@@ -41,13 +41,13 @@ app.get('/api/health', async (req, res) => {
   }
 });
 
-// ── Benchmark — frames per minute / day / week / month ────────────
+// ── Benchmark — workflow executions per minute / day / week / month
 app.get('/api/benchmark', async (req, res) => {
   try {
     const minuteQuery = `
       SELECT
         to_char(date_trunc('minute', started_at), 'YYYY-MM-DD HH24:MI:00') AS time_bucket,
-        COUNT(*)::int AS frames
+        COUNT(*)::int AS executions
       FROM workflow_org_executions
       WHERE started_at IS NOT NULL AND started_at >= NOW() - INTERVAL '24 hours'
       GROUP BY date_trunc('minute', started_at)
@@ -57,7 +57,7 @@ app.get('/api/benchmark', async (req, res) => {
     const dayQuery = `
       SELECT
         to_char(date_trunc('day', started_at), 'YYYY-MM-DD') AS time_bucket,
-        COUNT(*)::int AS frames
+        COUNT(*)::int AS executions
       FROM workflow_org_executions
       WHERE started_at IS NOT NULL AND started_at >= NOW() - INTERVAL '30 days'
       GROUP BY date_trunc('day', started_at)
@@ -67,7 +67,7 @@ app.get('/api/benchmark', async (req, res) => {
     const weekQuery = `
       SELECT
         to_char(date_trunc('week', started_at), 'YYYY-MM-DD') AS time_bucket,
-        COUNT(*)::int AS frames
+        COUNT(*)::int AS executions
       FROM workflow_org_executions
       WHERE started_at IS NOT NULL AND started_at >= NOW() - INTERVAL '12 weeks'
       GROUP BY date_trunc('week', started_at)
@@ -77,7 +77,7 @@ app.get('/api/benchmark', async (req, res) => {
     const monthQuery = `
       SELECT
         to_char(date_trunc('month', started_at), 'YYYY-MM') AS time_bucket,
-        COUNT(*)::int AS frames
+        COUNT(*)::int AS executions
       FROM workflow_org_executions
       WHERE started_at IS NOT NULL AND started_at >= NOW() - INTERVAL '12 months'
       GROUP BY date_trunc('month', started_at)
@@ -86,20 +86,49 @@ app.get('/api/benchmark', async (req, res) => {
 
     const summaryQuery = `
       SELECT
-        COUNT(*) FILTER (WHERE started_at >= NOW() - INTERVAL '24 hours')::int AS frames_24h,
-        COUNT(*) FILTER (WHERE started_at >= NOW() - INTERVAL '7 days')::int  AS frames_7d,
-        COUNT(*) FILTER (WHERE started_at >= NOW() - INTERVAL '30 days')::int AS frames_30d,
-        COUNT(*)::int AS frames_total
+        COUNT(*) FILTER (WHERE started_at >= NOW() - INTERVAL '24 hours')::int AS executions_24h,
+        COUNT(*) FILTER (WHERE started_at >= NOW() - INTERVAL '7 days')::int  AS executions_7d,
+        COUNT(*) FILTER (WHERE started_at >= NOW() - INTERVAL '30 days')::int AS executions_30d,
+        COUNT(*)::int AS executions_total
       FROM workflow_org_executions
       WHERE started_at IS NOT NULL
     `;
 
-    const [perMinute, perDay, perWeek, perMonth, summary] = await Promise.all([
+    const byWorkflowQuery = `
+      SELECT
+        wc.name AS workflow_name,
+        COUNT(*)::int AS executions
+      FROM workflow_org_executions woe
+      JOIN workflow_catalog wc ON wc.id = woe.catalog_id
+      WHERE woe.started_at >= NOW() - INTERVAL '30 days'
+      GROUP BY wc.name
+      ORDER BY executions DESC
+      LIMIT 10
+    `;
+
+    const recentQuery = `
+      SELECT
+        woe.id AS execution_id,
+        wc.name AS workflow_name,
+        woe.trigger_event,
+        woe.status,
+        woe.started_at,
+        woe.duration_ms
+      FROM workflow_org_executions woe
+      JOIN workflow_catalog wc ON wc.id = woe.catalog_id
+      WHERE woe.started_at IS NOT NULL
+      ORDER BY woe.started_at DESC
+      LIMIT 25
+    `;
+
+    const [perMinute, perDay, perWeek, perMonth, summary, byWorkflow, recent] = await Promise.all([
       pool.query(minuteQuery),
       pool.query(dayQuery),
       pool.query(weekQuery),
       pool.query(monthQuery),
       pool.query(summaryQuery),
+      pool.query(byWorkflowQuery),
+      pool.query(recentQuery),
     ]);
 
     res.json({
@@ -109,6 +138,8 @@ app.get('/api/benchmark', async (req, res) => {
       perWeek: perWeek.rows,
       perMonth: perMonth.rows,
       summary: summary.rows[0],
+      byWorkflow: byWorkflow.rows,
+      recent: recent.rows,
       generatedAt: new Date().toISOString(),
     });
   } catch (err) {
