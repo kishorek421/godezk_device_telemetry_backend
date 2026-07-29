@@ -216,6 +216,80 @@ app.get('/api/bench-suite', async (req, res) => {
       pool.query(queueActiveWorkersQuery),
     ]);
 
+    // ── RTSP Handler metrics (schema-flexible over context.event)
+    const cameraKeyExpr = `COALESCE(
+      NULLIF(woe.context->'event'->>'camera_id',''),
+      NULLIF(woe.context->'event'->>'device_id',''),
+      NULLIF(woe.context->'event'->>'source_id',''),
+      NULLIF(woe.context->'event'->>'stream_id',''),
+      NULLIF(woe.context->'event'->>'camera',''),
+      NULLIF(woe.context->'event'->>'device','')
+    )`;
+
+    const rtspFramesQuery = `
+      SELECT COUNT(*)::int AS frames_total
+      FROM workflow_org_executions woe
+      WHERE woe.started_at >= NOW() - INTERVAL '${interval}'
+        AND ${cameraKeyExpr} IS NOT NULL
+    `;
+
+    const rtspActive5mQuery = `
+      SELECT COUNT(DISTINCT ${cameraKeyExpr})::int AS active_5m
+      FROM workflow_org_executions woe
+      WHERE woe.started_at >= NOW() - INTERVAL '5 minutes'
+        AND ${cameraKeyExpr} IS NOT NULL
+    `;
+
+    const decodeExpr = `COALESCE(
+      NULLIF(woe.context->'event'->>'rtsp_decode_ms','')::numeric,
+      NULLIF(woe.context->'event'->>'decode_ms','')::numeric,
+      NULLIF(woe.context->'event'->>'ingest_ms','')::numeric,
+      NULLIF(woe.context->'event'->>'frame_decode_ms','')::numeric
+    )`;
+    const decodePresence = `(
+      (woe.context->'event'->>'rtsp_decode_ms') IS NOT NULL AND (woe.context->'event'->>'rtsp_decode_ms') <> '' OR
+      (woe.context->'event'->>'decode_ms') IS NOT NULL AND (woe.context->'event'->>'decode_ms') <> '' OR
+      (woe.context->'event'->>'ingest_ms') IS NOT NULL AND (woe.context->'event'->>'ingest_ms') <> '' OR
+      (woe.context->'event'->>'frame_decode_ms') IS NOT NULL AND (woe.context->'event'->>'frame_decode_ms') <> ''
+    )`;
+    const rtspDecodeQuery = `
+      SELECT ${pct(decodeExpr)}
+      FROM workflow_org_executions woe
+      WHERE woe.started_at >= NOW() - INTERVAL '${interval}' AND ${decodePresence}
+    `;
+
+    const encodeExpr = `COALESCE(
+      NULLIF(woe.context->'event'->>'base64_encode_ms','')::numeric,
+      NULLIF(woe.context->'event'->>'encode_ms','')::numeric,
+      NULLIF(woe.context->'event'->>'jpeg_encode_ms','')::numeric
+    )`;
+    const encodePresence = `(
+      (woe.context->'event'->>'base64_encode_ms') IS NOT NULL AND (woe.context->'event'->>'base64_encode_ms') <> '' OR
+      (woe.context->'event'->>'encode_ms') IS NOT NULL AND (woe.context->'event'->>'encode_ms') <> '' OR
+      (woe.context->'event'->>'jpeg_encode_ms') IS NOT NULL AND (woe.context->'event'->>'jpeg_encode_ms') <> ''
+    )`;
+    const rtspEncodeQuery = `
+      SELECT ${pct(encodeExpr)}
+      FROM workflow_org_executions woe
+      WHERE woe.started_at >= NOW() - INTERVAL '${interval}' AND ${encodePresence}
+    `;
+
+    const rtspFailuresQuery = `
+      SELECT COUNT(*)::int AS failures
+      FROM workflow_org_executions woe
+      WHERE woe.started_at >= NOW() - INTERVAL '${interval}'
+        AND woe.status = 'failed'
+        AND ${cameraKeyExpr} IS NOT NULL
+    `;
+
+    const [rtspFramesRes, rtspActive5mRes, rtspDecodeRes, rtspEncodeRes, rtspFailRes] = await Promise.all([
+      pool.query(rtspFramesQuery),
+      pool.query(rtspActive5mQuery),
+      pool.query(rtspDecodeQuery),
+      pool.query(rtspEncodeQuery),
+      pool.query(rtspFailuresQuery),
+    ]);
+
     const safe = (row) => row && row.count != null ? {
       avg: Number(row.avg || 0),
       p50: Number(row.p50 || 0),
@@ -258,6 +332,17 @@ app.get('/api/bench-suite', async (req, res) => {
       success: true,
       window: { hours },
       components: {
+        'RtspHandler': {
+          latency: { unit: 'ms', ...(safe(rtspDecodeRes.rows[0]) || safe(rtspEncodeRes.rows[0]) || {}) },
+          throughput: {
+            unit: 'frames',
+            perSecond: Number(((rtspFramesRes.rows[0]?.frames_total || 0) / seconds).toFixed(2)),
+            perMinute: Number((((rtspFramesRes.rows[0]?.frames_total || 0) / seconds) * 60).toFixed(2)),
+            total: rtspFramesRes.rows[0]?.frames_total || 0,
+          },
+          reliability: { failures: rtspFailRes.rows[0]?.failures || 0, activeCameras5m: rtspActive5mRes.rows[0]?.active_5m || 0 },
+          resource: { cpuPct, rssMb }, // show process resource here too
+        },
         'Overall Pipeline': {
           latency: { unit: 'ms', ...overall, failed: failedOverall },
           throughput: { unit: 'executions', perSecond: overall ? Number((overall.count / seconds).toFixed(2)) : 0, perMinute: overall ? Number(((overall.count / seconds) * 60).toFixed(2)) : 0, total: overall?.count || 0 },
