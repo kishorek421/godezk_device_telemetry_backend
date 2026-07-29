@@ -1,6 +1,65 @@
 const express = require('express');
 const path = require('path');
 require('dotenv').config({ path: path.join(__dirname, '.env') });
+const { createClient } = require('redis');
+const os = require('os');
+
+// ── Redis (live stats pushed by backdoor backend) ─────────────────
+const REDIS_URL = process.env.REDIS_URL || 'redis://localhost:6379';
+let redisClient = null;
+let liveCache = null;
+let liveCacheAt = 0;
+const LIVE_TTL_MS = 2000; // cache for 2 seconds to avoid hammering Redis
+
+async function initRedis() {
+  try {
+    if (redisClient) return redisClient;
+    const client = createClient({ url: REDIS_URL, socket: { keepAlive: 5000 } });
+    client.on('error', (err) => console.warn('[Benchmark Backend] Redis error:', err?.message));
+    await client.connect();
+    redisClient = client;
+    console.log('[Benchmark Backend] Redis connected');
+    return redisClient;
+  } catch (err) {
+    console.warn('[Benchmark Backend] Redis connect failed:', err?.message);
+    return null;
+  }
+}
+
+const DEFAULT_LIVE_STATS = {
+  cpu_usage_percent: 0,
+  system: {
+    cpu_cores: os.cpus().length,
+    cpu_model: os.cpus()[0]?.model?.trim() || 'Unknown',
+    total_mem_bytes: os.totalmem(),
+    free_mem_bytes: os.freemem(),
+  },
+  memory: {
+    rss_bytes: 0,
+    heap_used_bytes: 0,
+    heap_total_bytes: 0,
+  },
+  uptime_seconds: 0,
+  gate: { total: 0, queued: 0, skipped: 0, throttled: 0, cooldown: 0, dropped: 0 },
+  workers: { pool_size: 0, busy_ratio: 0, queue_depth: 0 },
+};
+
+async function getLiveStats() {
+  const now = Date.now();
+  if (now - liveCacheAt < LIVE_TTL_MS && liveCache) return liveCache;
+  try {
+    if (!redisClient) await initRedis();
+    if (!redisClient) return DEFAULT_LIVE_STATS;
+    const raw = await redisClient.get('godezk:telemetry:live_stats');
+    if (!raw) return DEFAULT_LIVE_STATS;
+    const parsed = JSON.parse(raw);
+    liveCache = parsed;
+    liveCacheAt = now;
+    return parsed;
+  } catch (_) {
+    return DEFAULT_LIVE_STATS;
+  }
+}
 
 const { Pool } = require('pg');
 
@@ -187,6 +246,14 @@ app.get('/api/bench-suite', async (req, res) => {
 
     const seconds = hours * 3600;
 
+    // Pull live stats from Redis (backdoor backend origin)
+    const live = await getLiveStats();
+    const rssMb = Math.round((live?.memory?.rss_bytes || 0) / (1024 * 1024));
+    const cpuPct = Math.min(100, Math.max(0, Math.round(live?.cpu_usage_percent || 0)));
+    const poolSize = live?.workers?.pool_size || activeWorkersNow || 0;
+    const liveQueueDepth = live?.workers?.queue_depth || 0;
+    const busyRatio = live?.workers?.busy_ratio || 0;
+
     res.json({
       success: true,
       window: { hours },
@@ -194,6 +261,7 @@ app.get('/api/bench-suite', async (req, res) => {
         'Overall Pipeline': {
           latency: { unit: 'ms', ...overall, failed: failedOverall },
           throughput: { unit: 'executions', perSecond: overall ? Number((overall.count / seconds).toFixed(2)) : 0, perMinute: overall ? Number(((overall.count / seconds) * 60).toFixed(2)) : 0, total: overall?.count || 0 },
+          resource: { cpuPct, rssMb },
         },
         'FrameWeir': {
           latency: { unit: 'ms', ...weir },
@@ -213,10 +281,11 @@ app.get('/api/bench-suite', async (req, res) => {
         },
         'workflow_runner_queue': {
           reliability: { failures: failedOverall },
-          queue: { currentSize, avgSize, peakSize },
+          queue: { currentSize: Math.max(currentSize, liveQueueDepth), avgSize, peakSize },
         },
         'WorkerPool': {
-          resource: { activeWorkers: activeWorkersNow },
+          resource: { activeWorkers: poolSize, cpuPct, rssMb },
+          queue: { currentSize: liveQueueDepth, avgSize, peakSize },
         },
         'Database Nodes': {
           latency: { unit: 'ms', ...postgres },
@@ -353,6 +422,9 @@ async function start() {
     process.exit(1);
   }
 
+  // Connect Redis in background (non-fatal if unavailable)
+  initRedis().catch(() => {});
+
   const server = app.listen(PORT, '0.0.0.0', () => {
     console.log(`\n=============================================================`);
     console.log(`  Benchmark Backend running on http://localhost:${PORT}`);
@@ -363,6 +435,7 @@ async function start() {
     console.log(`[Benchmark Backend] ${signal} received. Shutting down...`);
     server.close(async () => {
       await pool.end();
+      try { if (redisClient) await redisClient.disconnect(); } catch (_) {}
       process.exit(0);
     });
   };
