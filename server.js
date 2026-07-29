@@ -107,23 +107,41 @@ app.get('/api/bench-suite', async (req, res) => {
       WHERE woe.started_at >= NOW() - INTERVAL '${interval}' AND val->>'nodeType' = '${nodeType}'
     `;
 
-    // 6) Queue stats (workflow_runner_queue)
+    // 6) Queue stats (workflow_runner_queue) — schema-flexible
     const queueCurrentSizeQuery = `
       SELECT COUNT(*)::int AS current_size
       FROM workflow_runner_queue
       WHERE status IN ('queued','running')
     `;
-    const queueSeriesQuery = `
-      SELECT date_trunc('minute', created_at) AS ts, COUNT(*)::int AS cnt
+
+    // Discover timestamp columns to build a time series if possible
+    const colsRes = await pool.query(`
+      SELECT column_name 
+      FROM information_schema.columns 
+      WHERE table_schema IN (current_schema(), 'public') 
+        AND table_name = 'workflow_runner_queue'
+    `);
+    const colSet = new Set(colsRes.rows.map(r => r.column_name));
+    const candidateTs = ['created_at', 'enqueued_at', 'queued_at', 'inserted_at', 'added_at', 'timestamp', 'ts', 'time', 'started_at'];
+    const tsCol = candidateTs.find(c => colSet.has(c));
+    const hasUpdatedAt = colSet.has('updated_at');
+
+    const queueSeriesQuery = tsCol ? `
+      SELECT date_trunc('minute', ${tsCol}) AS ts, COUNT(*)::int AS cnt
       FROM workflow_runner_queue
-      WHERE created_at >= NOW() - INTERVAL '${interval}'
-      GROUP BY date_trunc('minute', created_at)
+      WHERE ${tsCol} >= NOW() - INTERVAL '${interval}'
+      GROUP BY date_trunc('minute', ${tsCol})
       ORDER BY ts
-    `;
-    const queueActiveWorkersQuery = `
+    ` : null;
+
+    const queueActiveWorkersQuery = hasUpdatedAt ? `
       SELECT COUNT(DISTINCT executor_id)::int AS active_workers
       FROM workflow_runner_queue
       WHERE status = 'running' AND updated_at >= NOW() - INTERVAL '5 minutes'
+    ` : `
+      SELECT COUNT(DISTINCT executor_id)::int AS active_workers
+      FROM workflow_runner_queue
+      WHERE status = 'running'
     `;
 
     const [overallRes, weirRes, screenerRes, aiRes, postgresRes, notificationRes, minioRes, queueCurRes, queueSeriesRes, activeWorkersRes] = await Promise.all([
@@ -135,7 +153,7 @@ app.get('/api/bench-suite', async (req, res) => {
       pool.query(nodeStats('notification')),
       pool.query(nodeStats('minio')),
       pool.query(queueCurrentSizeQuery),
-      pool.query(queueSeriesQuery),
+      queueSeriesQuery ? pool.query(queueSeriesQuery) : Promise.resolve({ rows: [] }),
       pool.query(queueActiveWorkersQuery),
     ]);
 
@@ -159,10 +177,10 @@ app.get('/api/bench-suite', async (req, res) => {
     const minio = safe(minioRes.rows[0] || {});
 
     const currentSize = queueCurRes.rows[0]?.current_size || 0;
-    const avgSize = queueSeriesRes.rows.length
+    const avgSize = queueSeriesRes.rows && queueSeriesRes.rows.length
       ? Math.round(queueSeriesRes.rows.reduce((s, r) => s + Number(r.cnt || 0), 0) / queueSeriesRes.rows.length)
       : 0;
-    const peakSize = queueSeriesRes.rows.length
+    const peakSize = queueSeriesRes.rows && queueSeriesRes.rows.length
       ? Math.max(...queueSeriesRes.rows.map((r) => Number(r.cnt || 0)))
       : 0;
     const activeWorkersNow = activeWorkersRes.rows[0]?.active_workers || 0;
