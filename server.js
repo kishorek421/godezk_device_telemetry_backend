@@ -41,6 +41,183 @@ app.get('/api/health', async (req, res) => {
   }
 });
 
+// ── Benchmark Suite — per-component aggregates (24h window by default)
+app.get('/api/bench-suite', async (req, res) => {
+  try {
+    // Window selection: default to last 24 hours
+    const hours = Math.max(1, Math.min(parseInt(String(req.query.hours || '24'), 10) || 24, 168)); // 1..168 hours
+    const interval = `${hours} hours`;
+
+    // Helper snippets
+    const pct = (expr) => `
+      AVG(${expr})::float AS avg,
+      PERCENTILE_CONT(0.5) WITHIN GROUP (ORDER BY ${expr}::double precision) AS p50,
+      PERCENTILE_CONT(0.95) WITHIN GROUP (ORDER BY ${expr}::double precision) AS p95,
+      PERCENTILE_CONT(0.99) WITHIN GROUP (ORDER BY ${expr}::double precision) AS p99,
+      COUNT(*)::int AS count
+    `;
+
+    // 1) Overall pipeline duration (duration_ms)
+    const overallQuery = `
+      SELECT
+        ${pct('woe.duration_ms')},
+        COUNT(*) FILTER (WHERE woe.status = 'failed')::int AS failed
+      FROM workflow_org_executions woe
+      WHERE woe.started_at IS NOT NULL AND woe.started_at >= NOW() - INTERVAL '${interval}'
+    `;
+
+    // 2) FrameWeir (weir_cpu_ms in event context)
+    const weirQuery = `
+      SELECT ${pct("CAST(woe.context->'event'->>'weir_cpu_ms' AS NUMERIC)")}
+      FROM workflow_org_executions woe
+      WHERE woe.started_at >= NOW() - INTERVAL '${interval}'
+        AND (woe.context->'event'->>'weir_cpu_ms') IS NOT NULL
+        AND (woe.context->'event'->>'weir_cpu_ms') <> ''
+    `;
+
+    // 3) PreScreener (screener_cpu_ms)
+    const screenerQuery = `
+      SELECT ${pct("CAST(woe.context->'event'->>'screener_cpu_ms' AS NUMERIC)")}
+      FROM workflow_org_executions woe
+      WHERE woe.started_at >= NOW() - INTERVAL '${interval}'
+        AND (woe.context->'event'->>'screener_cpu_ms') IS NOT NULL
+        AND (woe.context->'event'->>'screener_cpu_ms') <> ''
+    `;
+
+    // 4) PerceptionGate / Inference Service (ai_time_ms OR inference_ms OR sum of ai_node durations)
+    const aiQuery = `
+      SELECT ${pct(`COALESCE(
+        CAST(woe.context->'event'->>'ai_time_ms' AS NUMERIC),
+        CAST(woe.context->'event'->>'inference_ms' AS NUMERIC),
+        (
+          SELECT SUM(CAST(val->>'duration_ms' AS INT))
+          FROM jsonb_each(CASE WHEN jsonb_typeof(woe.context->'node_results') = 'object' THEN woe.context->'node_results' ELSE '{}'::jsonb END) AS t(key, val)
+          WHERE val->>'nodeType' = 'ai_node'
+        )
+      )`)}
+      FROM workflow_org_executions woe
+      WHERE woe.started_at >= NOW() - INTERVAL '${interval}'
+    `;
+
+    // 5) Node-type aggregates from node_results (postgres, notification, minio)
+    const nodeStats = (nodeType) => `
+      SELECT ${pct("CAST(val->>'duration_ms' AS NUMERIC)")}
+      FROM workflow_org_executions woe,
+        LATERAL jsonb_each(CASE WHEN jsonb_typeof(woe.context->'node_results') = 'object' THEN woe.context->'node_results' ELSE '{}'::jsonb END) AS t(key, val)
+      WHERE woe.started_at >= NOW() - INTERVAL '${interval}' AND val->>'nodeType' = '${nodeType}'
+    `;
+
+    // 6) Queue stats (workflow_runner_queue)
+    const queueCurrentSizeQuery = `
+      SELECT COUNT(*)::int AS current_size
+      FROM workflow_runner_queue
+      WHERE status IN ('queued','running')
+    `;
+    const queueSeriesQuery = `
+      SELECT date_trunc('minute', created_at) AS ts, COUNT(*)::int AS cnt
+      FROM workflow_runner_queue
+      WHERE created_at >= NOW() - INTERVAL '${interval}'
+      GROUP BY date_trunc('minute', created_at)
+      ORDER BY ts
+    `;
+    const queueActiveWorkersQuery = `
+      SELECT COUNT(DISTINCT executor_id)::int AS active_workers
+      FROM workflow_runner_queue
+      WHERE status = 'running' AND updated_at >= NOW() - INTERVAL '5 minutes'
+    `;
+
+    const [overallRes, weirRes, screenerRes, aiRes, postgresRes, notificationRes, minioRes, queueCurRes, queueSeriesRes, activeWorkersRes] = await Promise.all([
+      pool.query(overallQuery),
+      pool.query(weirQuery),
+      pool.query(screenerQuery),
+      pool.query(aiQuery),
+      pool.query(nodeStats('postgres')),
+      pool.query(nodeStats('notification')),
+      pool.query(nodeStats('minio')),
+      pool.query(queueCurrentSizeQuery),
+      pool.query(queueSeriesQuery),
+      pool.query(queueActiveWorkersQuery),
+    ]);
+
+    const safe = (row) => row && row.count != null ? {
+      avg: Number(row.avg || 0),
+      p50: Number(row.p50 || 0),
+      p95: Number(row.p95 || 0),
+      p99: Number(row.p99 || 0),
+      count: Number(row.count || 0)
+    } : null;
+
+    const overallRow = overallRes.rows[0] || {};
+    const overall = safe(overallRow);
+    const failedOverall = Number(overallRow.failed || 0);
+
+    const weir = safe(weirRes.rows[0] || {});
+    const screener = safe(screenerRes.rows[0] || {});
+    const ai = safe(aiRes.rows[0] || {});
+    const postgres = safe(postgresRes.rows[0] || {});
+    const notification = safe(notificationRes.rows[0] || {});
+    const minio = safe(minioRes.rows[0] || {});
+
+    const currentSize = queueCurRes.rows[0]?.current_size || 0;
+    const avgSize = queueSeriesRes.rows.length
+      ? Math.round(queueSeriesRes.rows.reduce((s, r) => s + Number(r.cnt || 0), 0) / queueSeriesRes.rows.length)
+      : 0;
+    const peakSize = queueSeriesRes.rows.length
+      ? Math.max(...queueSeriesRes.rows.map((r) => Number(r.cnt || 0)))
+      : 0;
+    const activeWorkersNow = activeWorkersRes.rows[0]?.active_workers || 0;
+
+    const seconds = hours * 3600;
+
+    res.json({
+      success: true,
+      window: { hours },
+      components: {
+        'Overall Pipeline': {
+          latency: { unit: 'ms', ...overall, failed: failedOverall },
+          throughput: { unit: 'executions', perSecond: overall ? Number((overall.count / seconds).toFixed(2)) : 0, perMinute: overall ? Number(((overall.count / seconds) * 60).toFixed(2)) : 0, total: overall?.count || 0 },
+        },
+        'FrameWeir': {
+          latency: { unit: 'ms', ...weir },
+          throughput: { unit: 'frames', perSecond: weir ? Number((weir.count / seconds).toFixed(2)) : 0, perMinute: weir ? Number(((weir.count / seconds) * 60).toFixed(2)) : 0, total: weir?.count || 0 },
+        },
+        'PreScreener': {
+          latency: { unit: 'ms', ...screener },
+          throughput: { unit: 'frames', perSecond: screener ? Number((screener.count / seconds).toFixed(2)) : 0, perMinute: screener ? Number(((screener.count / seconds) * 60).toFixed(2)) : 0, total: screener?.count || 0 },
+        },
+        'PerceptionGate': {
+          latency: { unit: 'ms', ...ai },
+          throughput: { unit: 'inferences', perSecond: ai ? Number((ai.count / seconds).toFixed(2)) : 0, perMinute: ai ? Number(((ai.count / seconds) * 60).toFixed(2)) : 0, total: ai?.count || 0 },
+        },
+        'Inference Service': {
+          latency: { unit: 'ms', ...ai },
+          throughput: { unit: 'inferences', perSecond: ai ? Number((ai.count / seconds).toFixed(2)) : 0, perMinute: ai ? Number(((ai.count / seconds) * 60).toFixed(2)) : 0, total: ai?.count || 0 },
+        },
+        'workflow_runner_queue': {
+          reliability: { failures: failedOverall },
+          queue: { currentSize, avgSize, peakSize },
+        },
+        'WorkerPool': {
+          resource: { activeWorkers: activeWorkersNow },
+        },
+        'Database Nodes': {
+          latency: { unit: 'ms', ...postgres },
+        },
+        'Notification Nodes': {
+          latency: { unit: 'ms', ...notification },
+        },
+        'Storage Nodes': {
+          latency: { unit: 'ms', ...minio },
+        },
+      },
+      generatedAt: new Date().toISOString(),
+    });
+  } catch (err) {
+    console.error('[Benchmark Backend] bench-suite error:', err.message);
+    res.status(500).json({ success: false, error: err.message });
+  }
+});
+
 // ── Benchmark — workflow executions per minute / day / week / month
 app.get('/api/benchmark', async (req, res) => {
   try {
