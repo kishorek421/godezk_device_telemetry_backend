@@ -1,0 +1,339 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>GoDezk - Frame Workflow Journey Analytics</title>
+  <script src="https://cdn.tailwindcss.com"></script>
+  <script src="https://cdn.jsdelivr.net/npm/chart.js"></script>
+  <link href="https://fonts.googleapis.com/css2?family=Outfit:wght@300;400;500;600;700&display=swap" rel="stylesheet">
+  <style>
+    body { font-family: 'Outfit', sans-serif; background-color: #0b0f19; }
+  </style>
+</head>
+<body class="text-slate-100 min-h-screen">
+  <div class="max-w-7xl mx-auto p-6 space-y-6">
+    <!-- Header -->
+    <div class="flex items-center justify-between border-b border-slate-800 pb-4">
+      <div>
+        <h1 class="text-2xl font-bold bg-gradient-to-r from-indigo-400 via-purple-400 to-cyan-400 bg-clip-text text-transparent">GoDezk Ingestion & Execution Analytics</h1>
+        <p class="text-xs text-slate-400 mt-1">Real-time telemetry and tracking of where frames go, how long they take, and where they break</p>
+      </div>
+      <div class="flex items-center gap-3">
+        <span class="inline-flex items-center gap-1.5 px-2.5 py-0.5 rounded-full text-xs font-medium bg-emerald-500/10 text-emerald-400 border border-emerald-500/20">
+          <span class="h-1.5 w-1.5 rounded-full bg-emerald-400 animate-ping"></span>
+          Live Stream
+        </span>
+        <span id="countdown" class="text-xs font-mono text-slate-500">Refreshing in 10s</span>
+      </div>
+    </div>
+
+    <!-- KPI Cards Row -->
+    <div class="grid grid-cols-1 md:grid-cols-4 gap-6">
+      <div class="bg-slate-900/50 border border-slate-800/80 rounded-2xl p-5 backdrop-blur shadow-sm">
+        <p class="text-xs font-medium text-slate-400 uppercase tracking-wider">Frames Evaluated (Last 24h)</p>
+        <p id="stat-total" class="text-3xl font-bold text-slate-100 mt-2 font-mono">—</p>
+      </div>
+      <div class="bg-slate-900/50 border border-slate-800/80 rounded-2xl p-5 backdrop-blur shadow-sm">
+        <p class="text-xs font-medium text-slate-400 uppercase tracking-wider">Success Rate</p>
+        <div class="flex items-center gap-2 mt-2">
+          <p id="stat-rate" class="text-3xl font-bold text-emerald-400 font-mono">—</p>
+          <span id="stat-rate-badge" class="px-2 py-0.5 text-[10px] font-semibold bg-emerald-500/10 text-emerald-400 rounded">Healthy</span>
+        </div>
+      </div>
+      <div class="bg-slate-900/50 border border-slate-800/80 rounded-2xl p-5 backdrop-blur shadow-sm">
+        <p class="text-xs font-medium text-slate-400 uppercase tracking-wider">Avg Engine Duration</p>
+        <p id="stat-duration" class="text-3xl font-bold text-purple-400 mt-2 font-mono">— <span class="text-xs font-normal">ms</span></p>
+      </div>
+      <div class="bg-slate-900/50 border border-slate-800/80 rounded-2xl p-5 backdrop-blur shadow-sm">
+        <p class="text-xs font-medium text-slate-400 uppercase tracking-wider">Breaks / Failures (Active)</p>
+        <div class="flex items-center gap-2 mt-2">
+          <p id="stat-failures" class="text-3xl font-bold text-rose-500 font-mono">—</p>
+          <span id="stat-failures-badge" class="px-2 py-0.5 text-[10px] font-semibold bg-rose-500/10 text-rose-400 rounded hidden">Alert</span>
+        </div>
+      </div>
+    </div>
+
+    <!-- Charts Row -->
+    <div class="grid grid-cols-1 lg:grid-cols-3 gap-6">
+      <!-- Left: Line chart -->
+      <div class="lg:col-span-2 bg-slate-900/40 border border-slate-800/60 rounded-3xl p-6 backdrop-blur shadow-lg">
+        <div class="flex items-center justify-between mb-6">
+          <h2 class="text-sm font-semibold text-slate-200">Execution Throughput (Frames / Min)</h2>
+          <div class="flex items-center gap-4 text-xs font-mono">
+            <span class="flex items-center gap-1.5 text-emerald-400">
+              <span class="h-2 w-2 rounded-full bg-emerald-500"></span> Completed
+            </span>
+            <span class="flex items-center gap-1.5 text-rose-400">
+              <span class="h-2 w-2 rounded-full bg-rose-500"></span> Failed
+            </span>
+          </div>
+        </div>
+        <div class="h-72 w-full relative">
+          <canvas id="throughputChart"></canvas>
+        </div>
+      </div>
+
+      <!-- Right: Bar chart -->
+      <div class="bg-slate-900/40 border border-slate-800/60 rounded-3xl p-6 backdrop-blur shadow-lg">
+        <div class="flex items-center justify-between mb-6">
+          <h2 class="text-sm font-semibold text-slate-200">Processing Time Breakdown (per Layer)</h2>
+          <span class="text-[10px] text-indigo-400 font-semibold uppercase tracking-wider">Avg Latencies</span>
+        </div>
+        <div class="h-72 w-full relative">
+          <canvas id="latencyChart"></canvas>
+        </div>
+      </div>
+    </div>
+
+    <!-- Bottom Lists & Details -->
+    <div class="grid grid-cols-1 lg:grid-cols-2 gap-6">
+      <!-- Where it breaks (Failures Log) -->
+      <div class="bg-slate-900/40 border border-slate-800/60 rounded-3xl p-6 backdrop-blur shadow-lg flex flex-col h-[400px]">
+        <div class="flex items-center gap-2 mb-4">
+          <span class="h-2 w-2 rounded-full bg-rose-500"></span>
+          <h3 class="text-sm font-semibold text-slate-200">Where It Breaks (Latest Failure Logs)</h3>
+        </div>
+        <div class="flex-1 overflow-auto">
+          <table class="w-full text-left border-collapse text-xs">
+            <thead>
+              <tr class="border-b border-slate-800/60 text-slate-400 font-mono">
+                <th class="py-2 font-medium">Time</th>
+                <th class="py-2 font-medium">Workflow</th>
+                <th class="py-2 font-medium">Error Message</th>
+              </tr>
+            </thead>
+            <tbody id="failures-body" class="divide-y divide-slate-800/40">
+              <tr>
+                <td colspan="3" class="py-4 text-center text-slate-500">No failures recorded</td>
+              </tr>
+            </tbody>
+          </table>
+        </div>
+      </div>
+
+      <!-- Latest Successful Frame Journeys -->
+      <div class="bg-slate-900/40 border border-slate-800/60 rounded-3xl p-6 backdrop-blur shadow-lg flex flex-col h-[400px]">
+        <div class="flex items-center gap-2 mb-4">
+          <span class="h-2 w-2 rounded-full bg-emerald-500"></span>
+          <h3 class="text-sm font-semibold text-slate-200">Frame Lifecycle Journey Tracker</h3>
+        </div>
+        <div class="flex-1 overflow-auto">
+          <table class="w-full text-left border-collapse text-xs">
+            <thead>
+              <tr class="border-b border-slate-800/60 text-slate-400 font-mono">
+                <th class="py-2 font-medium">Time</th>
+                <th class="py-2 font-medium">Workflow</th>
+                <th class="py-2 font-medium text-center">Weir (DCM)</th>
+                <th class="py-2 font-medium text-center">PreScreen</th>
+                <th class="py-2 font-medium text-center">AI Gate</th>
+                <th class="py-2 font-medium text-center">Engine</th>
+              </tr>
+            </thead>
+            <tbody id="journeys-body" class="divide-y divide-slate-800/40 font-mono">
+              <tr>
+                <td colspan="6" class="py-4 text-center text-slate-500">No active journeys tracked</td>
+              </tr>
+            </tbody>
+          </table>
+        </div>
+      </div>
+    </div>
+  </div>
+
+  <script>
+    let throughputChart;
+    let latencyChart;
+
+    const tpCtx = document.getElementById('throughputChart').getContext('2d');
+    const latCtx = document.getElementById('latencyChart').getContext('2d');
+
+    function initThroughputChart(labels, completed, failed) {
+      throughputChart = new Chart(tpCtx, {
+        type: 'line',
+        data: {
+          labels: labels,
+          datasets: [
+            {
+              label: 'Completed',
+              data: completed,
+              borderColor: '#10b981',
+              backgroundColor: 'rgba(16, 185, 129, 0.05)',
+              borderWidth: 2,
+              tension: 0.3,
+              fill: true
+            },
+            {
+              label: 'Failed',
+              data: failed,
+              borderColor: '#f43f5e',
+              backgroundColor: 'rgba(244, 63, 94, 0.05)',
+              borderWidth: 2,
+              tension: 0.3,
+              fill: true
+            }
+          ]
+        },
+        options: {
+          responsive: true,
+          maintainAspectRatio: false,
+          plugins: { legend: { display: false } },
+          scales: {
+            x: { grid: { color: 'rgba(255,255,255,0.02)' }, ticks: { color: '#64748b', font: { size: 9 } } },
+            y: { grid: { color: 'rgba(255,255,255,0.02)' }, ticks: { color: '#64748b', font: { size: 9 } }, beginAtZero: true }
+          }
+        }
+      });
+    }
+
+    function initLatencyChart(weir, screener, decision, duration) {
+      latencyChart = new Chart(latCtx, {
+        type: 'bar',
+        data: {
+          labels: ['DCM Weir', 'PreScreener', 'AI Decision', 'Engine Run'],
+          datasets: [{
+            data: [weir, screener, decision, duration],
+            backgroundColor: [
+              'rgba(99, 102, 241, 0.75)',  // Indigo
+              'rgba(14, 165, 233, 0.75)',  // Sky
+              'rgba(168, 85, 247, 0.75)',  // Purple
+              'rgba(16, 185, 129, 0.75)'   // Emerald
+            ],
+            borderRadius: 8,
+            borderWidth: 0
+          }]
+        },
+        options: {
+          responsive: true,
+          maintainAspectRatio: false,
+          plugins: { legend: { display: false } },
+          scales: {
+            x: { grid: { display: false }, ticks: { color: '#64748b', font: { size: 10 } } },
+            y: { grid: { color: 'rgba(255,255,255,0.02)' }, ticks: { color: '#64748b', font: { size: 9 } }, title: { display: true, text: 'ms', color: '#64748b' } }
+          }
+        }
+      });
+    }
+
+    async function updateDashboard() {
+      try {
+        const res = await fetch('/api/dashboard-summary');
+        const json = await res.json();
+        if (!json.success) return;
+
+        // 1. Update KPI stats
+        const stats = json.stats;
+        document.getElementById('stat-total').innerText = stats.total_runs;
+        document.getElementById('stat-failures').innerText = stats.failed_runs;
+        document.getElementById('stat-duration').innerText = stats.avg_duration_ms;
+
+        let total = stats.total_runs;
+        let rate = total > 0 ? ((stats.successful_runs / total) * 100).toFixed(1) + '%' : '100%';
+        document.getElementById('stat-rate').innerText = rate;
+
+        const rateBadge = document.getElementById('stat-rate-badge');
+        const failBadge = document.getElementById('stat-failures-badge');
+        
+        if (parseFloat(rate) < 90) {
+          rateBadge.className = "px-2 py-0.5 text-[10px] font-semibold bg-amber-500/10 text-amber-400 rounded";
+          rateBadge.innerText = "Degraded";
+        } else {
+          rateBadge.className = "px-2 py-0.5 text-[10px] font-semibold bg-emerald-500/10 text-emerald-400 rounded";
+          rateBadge.innerText = "Healthy";
+        }
+
+        if (stats.failed_runs > 0) {
+          failBadge.classList.remove('hidden');
+        } else {
+          failBadge.classList.add('hidden');
+        }
+
+        // 2. Update Throughput chart
+        const tpData = json.throughput;
+        const labels = tpData.map(item => item.time_bucket.split(' ')[1].substring(0, 5));
+        const completed = tpData.map(item => parseInt(item.completed));
+        const failed = tpData.map(item => parseInt(item.failed));
+
+        if (throughputChart) {
+          throughputChart.data.labels = labels;
+          throughputChart.data.datasets[0].data = completed;
+          throughputChart.data.datasets[1].data = failed;
+          throughputChart.update();
+        } else {
+          initThroughputChart(labels, completed, failed);
+        }
+
+        // 3. Update Latency chart
+        const lat = json.latencies;
+        if (latencyChart) {
+          latencyChart.data.datasets[0].data = [
+            parseFloat(lat.avg_weir),
+            parseFloat(lat.avg_screener),
+            parseFloat(lat.avg_decision),
+            parseFloat(lat.avg_duration)
+          ];
+          latencyChart.update();
+        } else {
+          initLatencyChart(
+            parseFloat(lat.avg_weir),
+            parseFloat(lat.avg_screener),
+            parseFloat(lat.avg_decision),
+            parseFloat(lat.avg_duration)
+          );
+        }
+
+        // 4. Render failures table
+        const failuresBody = document.getElementById('failures-body');
+        if (json.failures.length === 0) {
+          failuresBody.innerHTML = `<tr><td colspan="3" class="py-4 text-center text-slate-500">No failures recorded in database</td></tr>`;
+        } else {
+          failuresBody.innerHTML = json.failures.map(f => `
+            <tr class="hover:bg-slate-900/30">
+              <td class="py-3 text-slate-400 font-mono">${f.failed_time}</td>
+              <td class="py-3 font-semibold text-slate-200">${f.workflow_name}</td>
+              <td class="py-3 text-rose-400 truncate max-w-xs font-semibold" title="${f.error_message}">${f.error_message || 'Unknown runner crash'}</td>
+            </tr>
+          `).join('');
+        }
+
+        // 5. Render active frame journeys table
+        const journeysBody = document.getElementById('journeys-body');
+        if (json.journeys.length === 0) {
+          journeysBody.innerHTML = `<tr><td colspan="6" class="py-4 text-center text-slate-500">No active journeys tracked</td></tr>`;
+        } else {
+          journeysBody.innerHTML = json.journeys.map(j => {
+            const statusCls = j.status === 'completed' 
+              ? 'text-emerald-400 bg-emerald-500/10' 
+              : (j.status === 'failed' ? 'text-rose-400 bg-rose-500/10' : 'text-sky-400 bg-sky-500/10');
+            return `
+              <tr class="hover:bg-slate-900/30">
+                <td class="py-3 text-slate-400">${j.start_time}</td>
+                <td class="py-3 font-semibold text-slate-200 truncate max-w-[120px]" title="${j.workflow_name}">${j.workflow_name}</td>
+                <td class="py-3 text-center text-indigo-400 font-medium">${parseFloat(j.weir_cpu).toFixed(2)} ms</td>
+                <td class="py-3 text-center text-sky-400 font-medium">${parseFloat(j.screener_cpu).toFixed(2)} ms</td>
+                <td class="py-3 text-center text-purple-400 font-medium">${parseFloat(j.decision_cpu).toFixed(2)} ms</td>
+                <td class="py-3 text-center text-emerald-400 font-medium">${j.duration_ms || '—'} ms</td>
+              </tr>
+            `;
+          }).join('');
+        }
+
+      } catch (err) {
+        console.error('Error fetching analytics dashboard:', err);
+      }
+    }
+
+    let countdown = 10;
+    setInterval(() => {
+      countdown--;
+      if (countdown <= 0) {
+        updateDashboard();
+        countdown = 10;
+      }
+      document.getElementById('countdown').innerText = 'Refreshing in ' + countdown + 's';
+    }, 1000);
+
+    updateDashboard();
+  </script>
+</body>
+</html>

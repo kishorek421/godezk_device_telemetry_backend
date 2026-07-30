@@ -1,31 +1,51 @@
+'use strict';
+
 const express = require('express');
 const path = require('path');
-require('dotenv').config({ path: path.join(__dirname, '.env') });
-const { createClient } = require('redis');
 const os = require('os');
+require('dotenv').config({ path: path.join(__dirname, '.env') });
 
-// ── Redis (live stats pushed by backdoor backend) ─────────────────
-const REDIS_URL = process.env.REDIS_URL || 'redis://localhost:6379';
+const { Pool } = require('pg');
+const { createClient } = require('redis');
+
+// ── PostgreSQL direct connection ─────────────────────────────────
+const pool = new Pool({
+  host: process.env.PG_HOST || 'localhost',
+  port: Number(process.env.PG_PORT || 5432),
+  database: process.env.PG_DATABASE || 'Godezk_medops',
+  user: process.env.PG_USER || 'postgres',
+  password: process.env.PG_PASSWORD || 'root',
+  ssl: process.env.PG_SSL === 'true' ? { rejectUnauthorized: false } : false,
+  max: 5,
+  connectionTimeoutMillis: 5000,
+  idleTimeoutMillis: 30000,
+  options: `-c search_path=${process.env.PG_SEARCH_PATH || 'device_workflow_schema,public'}`,
+});
+pool.on('error', (err) => console.error('[Telemetry Backend] PostgreSQL pool error:', err.message));
+
+// ── Redis client for live process stats ──────────────────────────
 let redisClient = null;
-let liveCache = null;
-let liveCacheAt = 0;
-const LIVE_TTL_MS = 2000; // cache for 2 seconds to avoid hammering Redis
+let redisReady = false;
 
 async function initRedis() {
   try {
-    if (redisClient) return redisClient;
-    const client = createClient({ url: REDIS_URL, socket: { keepAlive: 5000 } });
-    client.on('error', (err) => console.warn('[Benchmark Backend] Redis error:', err?.message));
-    await client.connect();
-    redisClient = client;
-    console.log('[Benchmark Backend] Redis connected');
-    return redisClient;
+    redisClient = createClient({
+      url: process.env.REDIS_URL || 'redis://localhost:6379',
+      socket: {
+        reconnectStrategy: (retries) => Math.min(retries * 500, 10000),
+      },
+    });
+    redisClient.on('error', () => { redisReady = false; });
+    redisClient.on('ready', () => { redisReady = true; });
+    await redisClient.connect();
+    console.log('[Telemetry Backend] Redis connected');
   } catch (err) {
-    console.warn('[Benchmark Backend] Redis connect failed:', err?.message);
-    return null;
+    console.warn('[Telemetry Backend] Redis unavailable, live metrics will use defaults:', err.message);
+    redisReady = false;
   }
 }
 
+// Default live stats when Redis is unavailable
 const DEFAULT_LIVE_STATS = {
   cpu_usage_percent: 0,
   system: {
@@ -41,362 +61,1043 @@ const DEFAULT_LIVE_STATS = {
   },
   uptime_seconds: 0,
   gate: { total: 0, queued: 0, skipped: 0, throttled: 0, cooldown: 0, dropped: 0 },
-  workers: { pool_size: 0, busy_ratio: 0, queue_depth: 0 },
+  workers: { busy_ratio: 0, queue_depth: 0, pool_size: 0 },
 };
+
+let localLiveStatsCache = null;
+let localLiveStatsCacheTime = 0;
+const LIVE_STATS_CACHE_TTL = 2000; // 2 seconds
 
 async function getLiveStats() {
   const now = Date.now();
-  if (now - liveCacheAt < LIVE_TTL_MS && liveCache) return liveCache;
+  // Return local memory cache if it's less than 2 seconds old
+  if (localLiveStatsCache && (now - localLiveStatsCacheTime < LIVE_STATS_CACHE_TTL)) {
+    return localLiveStatsCache;
+  }
+
+  if (!redisReady || !redisClient) {
+    return localLiveStatsCache || DEFAULT_LIVE_STATS;
+  }
+
   try {
-    if (!redisClient) await initRedis();
-    if (!redisClient) return DEFAULT_LIVE_STATS;
     const raw = await redisClient.get('godezk:telemetry:live_stats');
-    if (!raw) return DEFAULT_LIVE_STATS;
-    const parsed = JSON.parse(raw);
-    liveCache = parsed;
-    liveCacheAt = now;
-    return parsed;
+    if (raw) {
+      localLiveStatsCache = JSON.parse(raw);
+      localLiveStatsCacheTime = now;
+      return localLiveStatsCache;
+    }
+    return localLiveStatsCache || DEFAULT_LIVE_STATS;
   } catch (_) {
-    return DEFAULT_LIVE_STATS;
+    return localLiveStatsCache || DEFAULT_LIVE_STATS;
   }
 }
 
-const { Pool } = require('pg');
-
+// ── Express app ──────────────────────────────────────────────────
 const app = express();
-const PORT = Number(process.env.PORT || 3031);
+const PORT = process.env.ANALYTICS_PORT || 3031;
 
-// ── PostgreSQL (read-only pull from the backdoor database) ────────
-const pool = new Pool({
-  host: process.env.PG_HOST || 'localhost',
-  port: Number(process.env.PG_PORT || 5432),
-  database: process.env.PG_DATABASE || 'Godezk_medops',
-  user: process.env.PG_USER || 'postgres',
-  password: process.env.PG_PASSWORD || 'root',
-  ssl: process.env.PG_SSL === 'true' ? { rejectUnauthorized: false } : false,
-  max: 5,
-  connectionTimeoutMillis: 5000,
-  idleTimeoutMillis: 30000,
-  options: `-c search_path=${process.env.PG_SEARCH_PATH || 'device_workflow_schema,public'}`,
-});
-
-// ── Middleware ────────────────────────────────────────────────────
 app.use(express.json());
+
+// CORS
 app.use((req, res, next) => {
-  res.setHeader('Access-Control-Allow-Origin', '*');
-  res.setHeader('Access-Control-Allow-Methods', 'GET, OPTIONS');
-  res.setHeader('Access-Control-Allow-Headers', 'Content-Type');
-  if (req.method === 'OPTIONS') return res.sendStatus(204);
+  res.header('Access-Control-Allow-Origin', '*');
+  res.header('Access-Control-Allow-Headers', 'Origin, X-Requested-With, Content-Type, Accept');
+  res.header('Access-Control-Allow-Methods', 'GET, POST, OPTIONS');
   next();
 });
 
-// ── Health check ──────────────────────────────────────────────────
-app.get('/api/health', async (req, res) => {
+// ── 1. Dashboard overview KPIs & Trends ──────────────────────────
+app.get('/api/dashboard-summary', async (req, res) => {
   try {
-    await pool.query('SELECT 1');
-    res.json({ success: true, status: 'ok' });
-  } catch (err) {
-    res.status(503).json({ success: false, status: 'db_unreachable', error: err.message });
-  }
-});
+    const telemetry = await getLiveStats();
+    const tz = Intl.DateTimeFormat().resolvedOptions().timeZone || 'UTC';
 
-// ── Benchmark Suite — per-component aggregates (24h window by default)
-app.get('/api/bench-suite', async (req, res) => {
-  try {
-    // Window selection: default to last 24 hours
-    const hours = Math.max(1, Math.min(parseInt(String(req.query.hours || '24'), 10) || 24, 168)); // 1..168 hours
-    const interval = `${hours} hours`;
-
-    // Helper snippets
-    const pct = (expr) => `
-      AVG(${expr})::float AS avg,
-      PERCENTILE_CONT(0.5) WITHIN GROUP (ORDER BY ${expr}::double precision) AS p50,
-      PERCENTILE_CONT(0.95) WITHIN GROUP (ORDER BY ${expr}::double precision) AS p95,
-      PERCENTILE_CONT(0.99) WITHIN GROUP (ORDER BY ${expr}::double precision) AS p99,
-      COUNT(*)::int AS count
+    const kpiQuery = `
+      SELECT 
+        COUNT(*)::int AS total,
+        COUNT(*) FILTER (WHERE status = 'completed')::int AS completed,
+        0::int AS skipped,
+        COUNT(*) FILTER (WHERE status = 'failed')::int AS failed,
+        COALESCE(ROUND(AVG(duration_ms)), 0)::int AS avg_total
+      FROM workflow_org_executions
+      WHERE started_at >= NOW() - INTERVAL '24 hours'
     `;
 
-    // 1) Overall pipeline duration (duration_ms)
-    const overallQuery = `
-      SELECT
-        ${pct('woe.duration_ms')},
-        COUNT(*) FILTER (WHERE woe.status = 'failed')::int AS failed
+    const latencyQuery = `
+      SELECT 
+        COALESCE(AVG(CAST(COALESCE(context->'event'->>'weir_cpu_ms', '0') AS NUMERIC)), 0)::int AS weir,
+        COALESCE(AVG(CAST(COALESCE(context->'event'->>'screener_cpu_ms', '0') AS NUMERIC)), 0)::int AS screener,
+        COALESCE(AVG(CAST(COALESCE(context->'event'->>'ai_time_ms', context->'event'->>'inference_ms', '0') AS NUMERIC)), 0)::int AS decision,
+        COALESCE(AVG(duration_ms), 0)::int AS duration
+      FROM workflow_org_executions
+      WHERE status = 'completed' AND started_at >= NOW() - INTERVAL '24 hours'
+    `;
+
+    const failuresQuery = `
+      SELECT 
+        woe.id::text AS id,
+        wc.name AS workflow_name,
+        woe.trigger_event AS trigger_event,
+        woe.error_message AS error_message,
+        to_char(woe.started_at, 'HH24:MI:SS') AS failed_time
       FROM workflow_org_executions woe
-      WHERE woe.started_at IS NOT NULL AND woe.started_at >= NOW() - INTERVAL '${interval}'
+      JOIN workflow_catalog wc ON wc.id = woe.catalog_id
+      WHERE woe.status = 'failed' AND woe.started_at >= NOW() - INTERVAL '24 hours'
+      ORDER BY woe.started_at DESC
+      LIMIT 10
     `;
 
-    // 2) FrameWeir (weir_cpu_ms in event context)
-    const weirQuery = `
-      SELECT ${pct("CAST(woe.context->'event'->>'weir_cpu_ms' AS NUMERIC)")}
+    const journeysQuery = `
+      SELECT 
+        woe.id::text AS id,
+        wc.name AS workflow_name,
+        woe.status,
+        COALESCE(CAST(woe.context->'event'->>'weir_cpu_ms' AS NUMERIC), 0) AS weir_cpu,
+        COALESCE(CAST(woe.context->'event'->>'screener_cpu_ms' AS NUMERIC), 0) AS screener_cpu,
+        COALESCE(CAST(woe.context->'event'->>'ai_time_ms' AS NUMERIC), CAST(woe.context->'event'->>'inference_ms' AS NUMERIC), 0) AS decision_cpu,
+        woe.duration_ms AS duration_ms,
+        to_char(woe.started_at, 'HH24:MI:SS') AS start_time
       FROM workflow_org_executions woe
-      WHERE woe.started_at >= NOW() - INTERVAL '${interval}'
-        AND (woe.context->'event'->>'weir_cpu_ms') IS NOT NULL
-        AND (woe.context->'event'->>'weir_cpu_ms') <> ''
+      JOIN workflow_catalog wc ON wc.id = woe.catalog_id
+      WHERE woe.started_at >= NOW() - INTERVAL '24 hours'
+      ORDER BY woe.started_at DESC
+      LIMIT 10
     `;
 
-    // 3) PreScreener (screener_cpu_ms)
-    const screenerQuery = `
-      SELECT ${pct("CAST(woe.context->'event'->>'screener_cpu_ms' AS NUMERIC)")}
+    const throughputQuery = `
+      SELECT 
+        to_char(date_trunc('minute', started_at), 'YYYY-MM-DD HH24:MI:00') AS time_bucket,
+        COUNT(*) FILTER (WHERE status = 'completed') AS completed,
+        COUNT(*) FILTER (WHERE status = 'failed') AS failed,
+        COUNT(*) AS total
+      FROM workflow_org_executions
+      WHERE started_at >= (SELECT COALESCE(MAX(started_at), NOW()) FROM workflow_org_executions) - INTERVAL '2 hours'
+      GROUP BY date_trunc('minute', started_at)
+      ORDER BY date_trunc('minute', started_at) ASC
+    `;
+
+    const cameraQuery = `
+      SELECT 
+        COALESCE(context->'event'->>'device_id', 'unknown') AS id,
+        COUNT(*)::int AS received,
+        0::int AS skipped,
+        COUNT(*) FILTER (WHERE status = 'completed')::int AS completed,
+        COALESCE(ROUND(AVG(duration_ms)), 0)::int AS avg_time
+      FROM workflow_org_executions
+      WHERE started_at >= NOW() - INTERVAL '24 hours'
+      GROUP BY COALESCE(context->'event'->>'device_id', 'unknown')
+    `;
+
+    const workerQuery = `
+      SELECT 
+        COALESCE(context->'event'->>'worker_id', 'worker-1') AS name,
+        COUNT(*)::int AS jobs,
+        COALESCE(ROUND(AVG(duration_ms)), 0)::int AS time,
+        COALESCE(ROUND(AVG(CAST(context->>'cpu_us' AS NUMERIC))), 0)::int AS cpu_us,
+        COALESCE(ROUND(AVG(CAST(context->>'peak_rss' AS NUMERIC))), 0)::int AS peak_rss
+      FROM workflow_org_executions
+      WHERE started_at >= NOW() - INTERVAL '24 hours'
+      GROUP BY COALESCE(context->'event'->>'worker_id', 'worker-1')
+    `;
+
+    const modelQuery = `
+      WITH execution_ai_details AS (
+        SELECT 
+          woe.id,
+          woe.status,
+          COALESCE(
+            NULLIF(NULLIF(woe.context->'event'->>'ai_service', 'unknown'), ''),
+            (
+              SELECT el->'data'->>'ai_service' 
+              FROM jsonb_array_elements(
+                CASE WHEN jsonb_typeof(wc.nodes_definition) = 'array' THEN wc.nodes_definition ELSE '[]'::jsonb END
+              ) AS el
+              WHERE el->>'type' = 'ai_node' 
+              LIMIT 1
+            ),
+            'unknown'
+          ) AS ai_service,
+          COALESCE(
+            CAST(woe.context->'event'->>'ai_time_ms' AS NUMERIC),
+            CAST(woe.context->'event'->>'inference_ms' AS NUMERIC),
+            (
+              SELECT SUM(CAST(val->>'duration_ms' AS INT))
+              FROM jsonb_each(
+                CASE WHEN jsonb_typeof(woe.context->'node_results') = 'object' THEN woe.context->'node_results' ELSE '{}'::jsonb END
+              ) AS t(key, val)
+              WHERE val->>'nodeType' = 'ai_node'
+            ),
+            0
+          )::int AS ai_dur,
+          COALESCE(
+            CAST(woe.context->'event'->>'confidence' AS NUMERIC),
+            (
+              SELECT CAST(val->'output'->>'confidence' AS NUMERIC)
+              FROM jsonb_each(
+                CASE WHEN jsonb_typeof(woe.context->'node_results') = 'object' THEN woe.context->'node_results' ELSE '{}'::jsonb END
+              ) AS t(key, val)
+              WHERE val->>'nodeType' = 'ai_node' AND val->'output'->>'confidence' IS NOT NULL
+              LIMIT 1
+            ),
+            0
+          )::float AS confidence
+        FROM workflow_org_executions woe
+        JOIN workflow_catalog wc ON wc.id = woe.catalog_id
+        WHERE woe.started_at >= NOW() - INTERVAL '24 hours'
+      )
+      SELECT 
+        ai_service AS name,
+        COUNT(*)::int AS total,
+        COALESCE(ROUND(AVG(ai_dur)), 0)::int AS avg_time,
+        COALESCE(AVG(confidence), 0)::float AS conf,
+        COUNT(*) FILTER (WHERE status = 'failed')::int AS failed
+      FROM execution_ai_details
+      WHERE ai_service IS NOT NULL AND ai_service <> '' AND ai_service <> 'unknown'
+      GROUP BY ai_service
+    `;
+
+    const workflowQuery = `
+      SELECT 
+        wc.name AS name,
+        COUNT(*)::int AS executions,
+        COALESCE(
+          ROUND(AVG(woe.duration_ms) FILTER (WHERE woe.started_at >= NOW() - INTERVAL '2 hours')),
+          COALESCE(ROUND(AVG(woe.duration_ms)), 0)
+        )::int AS duration,
+        COUNT(*) FILTER (WHERE woe.status = 'completed')::int AS completed,
+        COUNT(*) FILTER (WHERE woe.status = 'failed')::int AS failed,
+        COUNT(*) FILTER (WHERE woe.started_at >= NOW() - INTERVAL '2 hours' AND woe.status = 'completed')::int AS completed_recent,
+        COUNT(*) FILTER (WHERE woe.started_at >= NOW() - INTERVAL '2 hours')::int AS executions_recent
       FROM workflow_org_executions woe
-      WHERE woe.started_at >= NOW() - INTERVAL '${interval}'
-        AND (woe.context->'event'->>'screener_cpu_ms') IS NOT NULL
-        AND (woe.context->'event'->>'screener_cpu_ms') <> ''
+      JOIN workflow_catalog wc ON wc.id = woe.catalog_id
+      WHERE woe.started_at >= NOW() - INTERVAL '24 hours'
+      GROUP BY wc.name
     `;
 
-    // 4) PerceptionGate / Inference Service (ai_time_ms OR inference_ms OR sum of ai_node durations)
-    const aiQuery = `
-      SELECT ${pct(`COALESCE(
-        CAST(woe.context->'event'->>'ai_time_ms' AS NUMERIC),
-        CAST(woe.context->'event'->>'inference_ms' AS NUMERIC),
-        (
-          SELECT SUM(CAST(val->>'duration_ms' AS INT))
-          FROM jsonb_each(CASE WHEN jsonb_typeof(woe.context->'node_results') = 'object' THEN woe.context->'node_results' ELSE '{}'::jsonb END) AS t(key, val)
-          WHERE val->>'nodeType' = 'ai_node'
-        )
-      )`)}
-      FROM workflow_org_executions woe
-      WHERE woe.started_at >= NOW() - INTERVAL '${interval}'
+    const queueQuery = `
+      SELECT COUNT(*)::int AS count 
+      FROM workflow_runner_queue 
+      WHERE status IN ('queued', 'running')
     `;
 
-    // 5) Node-type aggregates from node_results (postgres, notification, minio)
-    const nodeStats = (nodeType) => `
-      SELECT ${pct("CAST(val->>'duration_ms' AS NUMERIC)")}
-      FROM workflow_org_executions woe,
-        LATERAL jsonb_each(CASE WHEN jsonb_typeof(woe.context->'node_results') = 'object' THEN woe.context->'node_results' ELSE '{}'::jsonb END) AS t(key, val)
-      WHERE woe.started_at >= NOW() - INTERVAL '${interval}' AND val->>'nodeType' = '${nodeType}'
-    `;
-
-    // 6) Queue stats (workflow_runner_queue) — schema-flexible
-    const queueCurrentSizeQuery = `
-      SELECT COUNT(*)::int AS current_size
-      FROM workflow_runner_queue
-      WHERE status IN ('queued','running')
-    `;
-
-    // Discover timestamp columns to build a time series if possible
-    const colsRes = await pool.query(`
-      SELECT column_name 
-      FROM information_schema.columns 
-      WHERE table_schema IN (current_schema(), 'public') 
-        AND table_name = 'workflow_runner_queue'
-    `);
-    const colSet = new Set(colsRes.rows.map(r => r.column_name));
-    const candidateTs = ['created_at', 'enqueued_at', 'queued_at', 'inserted_at', 'added_at', 'timestamp', 'ts', 'time', 'started_at'];
-    const tsCol = candidateTs.find(c => colSet.has(c));
-    const hasUpdatedAt = colSet.has('updated_at');
-
-    const queueSeriesQuery = tsCol ? `
-      SELECT date_trunc('minute', ${tsCol}) AS ts, COUNT(*)::int AS cnt
-      FROM workflow_runner_queue
-      WHERE ${tsCol} >= NOW() - INTERVAL '${interval}'
-      GROUP BY date_trunc('minute', ${tsCol})
-      ORDER BY ts
-    ` : null;
-
-    const queueActiveWorkersQuery = hasUpdatedAt ? `
-      SELECT COUNT(DISTINCT executor_id)::int AS active_workers
-      FROM workflow_runner_queue
-      WHERE status = 'running' AND updated_at >= NOW() - INTERVAL '5 minutes'
-    ` : `
-      SELECT COUNT(DISTINCT executor_id)::int AS active_workers
-      FROM workflow_runner_queue
+    const activeWorkersQuery = `
+      SELECT COUNT(*)::int AS count 
+      FROM workflow_runner_queue 
       WHERE status = 'running'
     `;
 
-    const [overallRes, weirRes, screenerRes, aiRes, postgresRes, notificationRes, minioRes, queueCurRes, queueSeriesRes, activeWorkersRes] = await Promise.all([
-      pool.query(overallQuery),
-      pool.query(weirQuery),
-      pool.query(screenerQuery),
-      pool.query(aiQuery),
-      pool.query(nodeStats('postgres')),
-      pool.query(nodeStats('notification')),
-      pool.query(nodeStats('minio')),
-      pool.query(queueCurrentSizeQuery),
-      queueSeriesQuery ? pool.query(queueSeriesQuery) : Promise.resolve({ rows: [] }),
-      pool.query(queueActiveWorkersQuery),
+    const queueTimelineQuery = `
+      SELECT 
+        to_char(date_trunc('minute', created_at AT TIME ZONE '${tz}'), 'YYYY-MM-DD HH24:MI:00') AS time_bucket,
+        COUNT(*)::int AS length
+      FROM workflow_runner_queue
+      WHERE created_at >= (SELECT COALESCE(MAX(created_at), NOW()) FROM workflow_runner_queue) - INTERVAL '2 hours'
+      GROUP BY date_trunc('minute', created_at AT TIME ZONE '${tz}')
+      ORDER BY date_trunc('minute', created_at AT TIME ZONE '${tz}') ASC
+    `;
+
+    const aiTrendQuery = `
+      SELECT 
+        to_char(date_trunc('minute', started_at), 'YYYY-MM-DD HH24:MI:00') AS time_bucket,
+        COALESCE(
+          ROUND(
+            AVG(
+              COALESCE(
+                CAST(context->'event'->>'ai_time_ms' AS NUMERIC),
+                CAST(context->'event'->>'inference_ms' AS NUMERIC),
+                (
+                  SELECT SUM(CAST(val->>'duration_ms' AS INT))
+                  FROM jsonb_each(
+                    CASE WHEN jsonb_typeof(context->'node_results') = 'object' THEN context->'node_results' ELSE '{}'::jsonb END
+                  ) AS t(key, val)
+                  WHERE val->>'nodeType' = 'ai_node'
+                )
+              )
+            )
+          ),
+          0
+        )::int AS avg_inference
+      FROM workflow_org_executions
+      WHERE started_at >= (SELECT COALESCE(MAX(started_at), NOW()) FROM workflow_org_executions) - INTERVAL '2 hours'
+      GROUP BY date_trunc('minute', started_at)
+      ORDER BY date_trunc('minute', started_at) ASC
+    `;
+
+    const confidenceTrendQuery = `
+      SELECT 
+        to_char(date_trunc('minute', started_at), 'YYYY-MM-DD HH24:MI:00') AS time_bucket,
+        COALESCE(
+          AVG(
+            COALESCE(
+              CAST(context->'event'->>'confidence' AS NUMERIC),
+              (
+                SELECT CAST(val->'output'->>'confidence' AS NUMERIC)
+                FROM jsonb_each(
+                  CASE WHEN jsonb_typeof(context->'node_results') = 'object' THEN context->'node_results' ELSE '{}'::jsonb END
+                ) AS t(key, val)
+                WHERE val->>'nodeType' = 'ai_node' AND val->'output'->>'confidence' IS NOT NULL
+                LIMIT 1
+              )
+            )
+          ), 
+          0
+        )::float AS avg_confidence
+      FROM workflow_org_executions
+      WHERE started_at >= (SELECT COALESCE(MAX(started_at), NOW()) FROM workflow_org_executions) - INTERVAL '2 hours'
+      GROUP BY date_trunc('minute', started_at)
+      ORDER BY date_trunc('minute', started_at) ASC
+    `;
+
+    const histogramQuery = `
+      SELECT 
+        COUNT(*) FILTER (WHERE duration_ms < 200)::int AS range_1,
+        COUNT(*) FILTER (WHERE duration_ms >= 200 AND duration_ms < 500)::int AS range_2,
+        COUNT(*) FILTER (WHERE duration_ms >= 500 AND duration_ms < 1000)::int AS range_3,
+        COUNT(*) FILTER (WHERE duration_ms >= 1000)::int AS range_4
+      FROM workflow_org_executions
+      WHERE started_at >= NOW() - INTERVAL '24 hours'
+    `;
+
+    const activeJobsQuery = `
+      SELECT 
+        COALESCE(executor_id, 'worker-1') AS name,
+        COUNT(*)::int AS active_count
+      FROM workflow_runner_queue
+      WHERE status = 'running'
+      GROUP BY COALESCE(executor_id, 'worker-1')
+    `;
+
+    const [
+      kpiRes,
+      latencyRes,
+      failuresRes,
+      journeysRes,
+      throughputRes,
+      cameraRes,
+      workerRes,
+      modelRes,
+      workflowRes,
+      queueRes,
+      activeWorkersRes,
+      queueTimelineRes,
+      aiTrendRes,
+      confidenceTrendRes,
+      histogramRes,
+      activeJobsRes
+    ] = await Promise.all([
+      pool.query(kpiQuery),
+      pool.query(latencyQuery),
+      pool.query(failuresQuery),
+      pool.query(journeysQuery),
+      pool.query(throughputQuery),
+      pool.query(cameraQuery),
+      pool.query(workerQuery),
+      pool.query(modelQuery),
+      pool.query(workflowQuery),
+      pool.query(queueQuery),
+      pool.query(activeWorkersQuery),
+      pool.query(queueTimelineQuery),
+      pool.query(aiTrendQuery),
+      pool.query(confidenceTrendQuery),
+      pool.query(histogramQuery),
+      pool.query(activeJobsQuery)
     ]);
 
-    // ── RTSP Handler metrics (schema-flexible over context.event)
-    const cameraKeyExpr = `COALESCE(
-      NULLIF(woe.context->'event'->>'camera_id',''),
-      NULLIF(woe.context->'event'->>'device_id',''),
-      NULLIF(woe.context->'event'->>'source_id',''),
-      NULLIF(woe.context->'event'->>'stream_id',''),
-      NULLIF(woe.context->'event'->>'camera',''),
-      NULLIF(woe.context->'event'->>'device','')
-    )`;
+    const activeMap = new Map(activeJobsRes.rows.map(r => [r.name, r.active_count]));
+    const queueLength = queueRes.rows[0]?.count || 0;
+    const activeWorkers = activeWorkersRes.rows[0]?.count || 0;
 
-    const rtspFramesQuery = `
-      SELECT COUNT(*)::int AS frames_total
-      FROM workflow_org_executions woe
-      WHERE woe.started_at >= NOW() - INTERVAL '${interval}'
-        AND ${cameraKeyExpr} IS NOT NULL
-    `;
+    const kpi = kpiRes.rows[0] || { total: 0, completed: 0, skipped: 0, failed: 0, avg_total: 0 };
+    const lat = latencyRes.rows[0] || { weir: 0, screener: 0, decision: 0, duration: 0 };
 
-    const rtspActive5mQuery = `
-      SELECT COUNT(DISTINCT ${cameraKeyExpr})::int AS active_5m
-      FROM workflow_org_executions woe
-      WHERE woe.started_at >= NOW() - INTERVAL '5 minutes'
-        AND ${cameraKeyExpr} IS NOT NULL
-    `;
+    const telemetrySkipped = telemetry?.gate?.skipped || 0;
+    const telemetryThrottled = telemetry?.gate?.throttled || 0;
+    const telemetryCooldown = telemetry?.gate?.cooldown || 0;
+    const telemetryDropped = telemetry?.gate?.dropped || 0;
+    const totalSkipped = telemetrySkipped + telemetryThrottled + telemetryCooldown + telemetryDropped;
 
-    const decodeExpr = `COALESCE(
-      NULLIF(woe.context->'event'->>'rtsp_decode_ms','')::numeric,
-      NULLIF(woe.context->'event'->>'decode_ms','')::numeric,
-      NULLIF(woe.context->'event'->>'ingest_ms','')::numeric,
-      NULLIF(woe.context->'event'->>'frame_decode_ms','')::numeric
-    )`;
-    const decodePresence = `(
-      (woe.context->'event'->>'rtsp_decode_ms') IS NOT NULL AND (woe.context->'event'->>'rtsp_decode_ms') <> '' OR
-      (woe.context->'event'->>'decode_ms') IS NOT NULL AND (woe.context->'event'->>'decode_ms') <> '' OR
-      (woe.context->'event'->>'ingest_ms') IS NOT NULL AND (woe.context->'event'->>'ingest_ms') <> '' OR
-      (woe.context->'event'->>'frame_decode_ms') IS NOT NULL AND (woe.context->'event'->>'frame_decode_ms') <> ''
-    )`;
-    const rtspDecodeQuery = `
-      SELECT ${pct(decodeExpr)}
-      FROM workflow_org_executions woe
-      WHERE woe.started_at >= NOW() - INTERVAL '${interval}' AND ${decodePresence}
-    `;
+    // Calculate backdoor backend process memory usage % (from Redis live stats)
+    const procRss = telemetry?.memory?.rss_bytes || 0;
+    const totalMem = telemetry?.system?.total_mem_bytes || os.totalmem();
+    const procMemPct = totalMem > 0 ? Math.round((procRss / totalMem) * 100) : 0;
+    const procCpuPct = Math.min(100, telemetry?.cpu_usage_percent || 0);
 
-    const encodeExpr = `COALESCE(
-      NULLIF(woe.context->'event'->>'base64_encode_ms','')::numeric,
-      NULLIF(woe.context->'event'->>'encode_ms','')::numeric,
-      NULLIF(woe.context->'event'->>'jpeg_encode_ms','')::numeric
-    )`;
-    const encodePresence = `(
-      (woe.context->'event'->>'base64_encode_ms') IS NOT NULL AND (woe.context->'event'->>'base64_encode_ms') <> '' OR
-      (woe.context->'event'->>'encode_ms') IS NOT NULL AND (woe.context->'event'->>'encode_ms') <> '' OR
-      (woe.context->'event'->>'jpeg_encode_ms') IS NOT NULL AND (woe.context->'event'->>'jpeg_encode_ms') <> ''
-    )`;
-    const rtspEncodeQuery = `
-      SELECT ${pct(encodeExpr)}
-      FROM workflow_org_executions woe
-      WHERE woe.started_at >= NOW() - INTERVAL '${interval}' AND ${encodePresence}
-    `;
-
-    const rtspFailuresQuery = `
-      SELECT COUNT(*)::int AS failures
-      FROM workflow_org_executions woe
-      WHERE woe.started_at >= NOW() - INTERVAL '${interval}'
-        AND woe.status = 'failed'
-        AND ${cameraKeyExpr} IS NOT NULL
-    `;
-
-    const [rtspFramesRes, rtspActive5mRes, rtspDecodeRes, rtspEncodeRes, rtspFailRes] = await Promise.all([
-      pool.query(rtspFramesQuery),
-      pool.query(rtspActive5mQuery),
-      pool.query(rtspDecodeQuery),
-      pool.query(rtspEncodeQuery),
-      pool.query(rtspFailuresQuery),
-    ]);
-
-    const safe = (row) => row && row.count != null ? {
-      avg: Number(row.avg || 0),
-      p50: Number(row.p50 || 0),
-      p95: Number(row.p95 || 0),
-      p99: Number(row.p99 || 0),
-      count: Number(row.count || 0)
-    } : null;
-
-    const overallRow = overallRes.rows[0] || {};
-    const overall = safe(overallRow);
-    const failedOverall = Number(overallRow.failed || 0);
-
-    const weir = safe(weirRes.rows[0] || {});
-    const screener = safe(screenerRes.rows[0] || {});
-    const ai = safe(aiRes.rows[0] || {});
-    const postgres = safe(postgresRes.rows[0] || {});
-    const notification = safe(notificationRes.rows[0] || {});
-    const minio = safe(minioRes.rows[0] || {});
-
-    const currentSize = queueCurRes.rows[0]?.current_size || 0;
-    const avgSize = queueSeriesRes.rows && queueSeriesRes.rows.length
-      ? Math.round(queueSeriesRes.rows.reduce((s, r) => s + Number(r.cnt || 0), 0) / queueSeriesRes.rows.length)
-      : 0;
-    const peakSize = queueSeriesRes.rows && queueSeriesRes.rows.length
-      ? Math.max(...queueSeriesRes.rows.map((r) => Number(r.cnt || 0)))
-      : 0;
-    const activeWorkersNow = activeWorkersRes.rows[0]?.active_workers || 0;
-
-    const seconds = hours * 3600;
-
-    // Pull live stats from Redis (backdoor backend origin)
-    const live = await getLiveStats();
-    const rssMb = Math.round((live?.memory?.rss_bytes || 0) / (1024 * 1024));
-    const cpuPct = Math.min(100, Math.max(0, Math.round(live?.cpu_usage_percent || 0)));
-    const poolSize = live?.workers?.pool_size || activeWorkersNow || 0;
-    const liveQueueDepth = live?.workers?.queue_depth || 0;
-    const busyRatio = live?.workers?.busy_ratio || 0;
+    const backendCpu = procCpuPct;
+    const backendMemoryPct = procMemPct;
 
     res.json({
       success: true,
-      window: { hours },
-      components: {
-        'RtspHandler': {
-          latency: { unit: 'ms', ...(safe(rtspDecodeRes.rows[0]) || safe(rtspEncodeRes.rows[0]) || {}) },
-          throughput: {
-            unit: 'frames',
-            perSecond: Number(((rtspFramesRes.rows[0]?.frames_total || 0) / seconds).toFixed(2)),
-            perMinute: Number((((rtspFramesRes.rows[0]?.frames_total || 0) / seconds) * 60).toFixed(2)),
-            total: rtspFramesRes.rows[0]?.frames_total || 0,
-          },
-          reliability: { failures: rtspFailRes.rows[0]?.failures || 0, activeCameras5m: rtspActive5mRes.rows[0]?.active_5m || 0 },
-          resource: { cpuPct, rssMb }, // show process resource here too
-        },
-        'Overall Pipeline': {
-          latency: { unit: 'ms', ...overall, failed: failedOverall },
-          throughput: { unit: 'executions', perSecond: overall ? Number((overall.count / seconds).toFixed(2)) : 0, perMinute: overall ? Number(((overall.count / seconds) * 60).toFixed(2)) : 0, total: overall?.count || 0 },
-          resource: { cpuPct, rssMb },
-        },
-        'FrameWeir': {
-          latency: { unit: 'ms', ...weir },
-          throughput: { unit: 'frames', perSecond: weir ? Number((weir.count / seconds).toFixed(2)) : 0, perMinute: weir ? Number(((weir.count / seconds) * 60).toFixed(2)) : 0, total: weir?.count || 0 },
-        },
-        'PreScreener': {
-          latency: { unit: 'ms', ...screener },
-          throughput: { unit: 'frames', perSecond: screener ? Number((screener.count / seconds).toFixed(2)) : 0, perMinute: screener ? Number(((screener.count / seconds) * 60).toFixed(2)) : 0, total: screener?.count || 0 },
-        },
-        'PerceptionGate': {
-          latency: { unit: 'ms', ...ai },
-          throughput: { unit: 'inferences', perSecond: ai ? Number((ai.count / seconds).toFixed(2)) : 0, perMinute: ai ? Number(((ai.count / seconds) * 60).toFixed(2)) : 0, total: ai?.count || 0 },
-        },
-        'Inference Service': {
-          latency: { unit: 'ms', ...ai },
-          throughput: { unit: 'inferences', perSecond: ai ? Number((ai.count / seconds).toFixed(2)) : 0, perMinute: ai ? Number(((ai.count / seconds) * 60).toFixed(2)) : 0, total: ai?.count || 0 },
-        },
-        'workflow_runner_queue': {
-          reliability: { failures: failedOverall },
-          queue: { currentSize: Math.max(currentSize, liveQueueDepth), avgSize, peakSize },
-        },
-        'WorkerPool': {
-          resource: { activeWorkers: poolSize, cpuPct, rssMb },
-          queue: { currentSize: liveQueueDepth, avgSize, peakSize },
-        },
-        'Database Nodes': {
-          latency: { unit: 'ms', ...postgres },
-        },
-        'Notification Nodes': {
-          latency: { unit: 'ms', ...notification },
-        },
-        'Storage Nodes': {
-          latency: { unit: 'ms', ...minio },
-        },
+      stats: {
+        receivedToday: kpi.total + totalSkipped,
+        completed: kpi.completed,
+        skipped: totalSkipped,
+        failed: kpi.failed,
+        avgProcessTime: kpi.avg_total,
+        avgAiTime: lat.decision,
+        activeWorkers: telemetry?.workers?.pool_size || activeWorkers || 1,
+        queueLength: telemetry?.workers?.queue_depth || queueLength
       },
-      generatedAt: new Date().toISOString(),
+      latencies: {
+        avg_weir: lat.weir,
+        avg_screener: lat.screener,
+        avg_decision: lat.decision,
+        avg_duration: lat.duration
+      },
+      failures: failuresRes.rows,
+      journeys: journeysRes.rows,
+      throughput: throughputRes.rows,
+      queueTimeline: queueTimelineRes.rows,
+      aiTrend: aiTrendRes.rows,
+      confidenceTrend: confidenceTrendRes.rows,
+      histogram: histogramRes.rows[0] || { range_1: 0, range_2: 0, range_3: 0, range_4: 0 },
+      cameras: cameraRes.rows.map(r => ({
+        id: r.id,
+        received: r.received,
+        skipped: r.skipped,
+        completed: r.completed,
+        avgTime: r.avg_time,
+        failureRate: r.received > 0 ? ((r.received - r.completed) / r.received * 100).toFixed(1) + '%' : '0%'
+      })),
+      workers: workerRes.rows.map(r => {
+        const activeJobs = activeMap.get(r.name) || 0;
+        const procCpuPercent = r.cpu_us > 0 && r.time > 0 ? Math.round((r.cpu_us / 1000) / r.time * 100) : 0;
+        const procMemPercent = r.peak_rss > 0 ? Math.round(((r.peak_rss * 1024) / totalMem) * 100) : 0;
+
+        const cpu = activeJobs > 0 
+          ? Math.min(95, Math.max(procCpuPercent, backendCpu, 20 + activeJobs * 10)) 
+          : Math.max(1, Math.round(backendCpu * 0.4));
+        const memory = activeJobs > 0 
+          ? Math.min(92, Math.max(procMemPercent, backendMemoryPct, 35 + activeJobs * 5)) 
+          : Math.max(1, backendMemoryPct);
+        return {
+          name: r.name,
+          jobs: r.jobs,
+          cpu,
+          memory,
+          queue: activeJobs,
+          time: r.time
+        };
+      }),
+      models: modelRes.rows.map(r => ({
+        name: r.name,
+        total: r.total,
+        avgTime: r.avg_time,
+        conf: r.conf,
+        failed: r.failed
+      })),
+      workflows: workflowRes.rows.map(r => ({
+        name: r.name,
+        executions: r.executions,
+        duration: r.duration,
+        success: r.executions > 0 ? ((r.completed / r.executions) * 100).toFixed(1) + '%' : '100.0%',
+        failed: r.failed
+      }))
     });
   } catch (err) {
-    console.error('[Benchmark Backend] bench-suite error:', err.message);
+    console.error('[Telemetry Backend] dashboard-summary error:', err.message);
     res.status(500).json({ success: false, error: err.message });
   }
 });
 
-// ── Benchmark — workflow executions per minute / day / week / month
+// ── 2. Recent frames list ────────────────────────────────────────
+app.get('/api/frames', async (req, res) => {
+  try {
+    const { rows } = await pool.query(`
+      SELECT 
+        woe.id::text AS "frameId",
+        COALESCE(woe.context->'event'->>'device_id', 'unknown') AS "cameraId",
+        wc.name AS pipeline,
+        COALESCE(
+          NULLIF(NULLIF(woe.context->'event'->>'ai_service', 'unknown'), ''),
+          (
+            SELECT el->'data'->>'ai_service' 
+            FROM jsonb_array_elements(
+              CASE WHEN jsonb_typeof(wc.nodes_definition) = 'array' THEN wc.nodes_definition ELSE '[]'::jsonb END
+            ) AS el
+            WHERE el->>'type' = 'ai_node' 
+            LIMIT 1
+          ),
+          'unknown'
+        ) AS "aiService",
+        wc.name AS workflow,
+        COALESCE(woe.context->'event'->>'worker_id', 'worker-1') AS "workerId",
+        COALESCE(
+          CAST(woe.context->'event'->>'confidence' AS NUMERIC),
+          (
+            SELECT CAST(val->'output'->>'confidence' AS NUMERIC)
+            FROM jsonb_each(
+              CASE WHEN jsonb_typeof(woe.context->'node_results') = 'object' THEN woe.context->'node_results' ELSE '{}'::jsonb END
+            ) AS t(key, val)
+            WHERE val->>'nodeType' = 'ai_node' AND val->'output'->>'confidence' IS NOT NULL
+            LIMIT 1
+          ),
+          0
+        )::float AS confidence,
+        woe.status AS status,
+        COALESCE(woe.context->'event'->>'detection', 'Match verified') AS detection,
+        to_char(woe.started_at, 'YYYY-MM-DD HH24:MI:SS') AS "receivedAt",
+        COALESCE(woe.duration_ms, 0)::int AS "totalTime"
+      FROM workflow_org_executions woe
+      JOIN workflow_catalog wc ON wc.id = woe.catalog_id
+      ORDER BY woe.started_at DESC
+      LIMIT 100
+    `);
+    res.json(rows);
+  } catch (err) {
+    res.status(500).json({ success: false, error: err.message });
+  }
+});
+
+// ── 3. Single frame journey segments ─────────────────────────────
+app.get('/api/frame/:frameId', async (req, res) => {
+  try {
+    const { rows } = await pool.query(`
+      SELECT 
+        woe.id::text AS "frameId",
+        COALESCE(woe.context->'event'->>'device_id', 'unknown') AS "cameraId",
+        wc.name AS pipeline,
+        COALESCE(woe.context->'event'->>'ai_service', 'unknown') AS "aiService",
+        wc.name AS workflow,
+        COALESCE(woe.context->'event'->>'worker_id', 'worker-1') AS "workerId",
+        COALESCE(CAST(woe.context->'event'->>'confidence' AS NUMERIC), 0)::float AS confidence,
+        woe.status AS status,
+        COALESCE(woe.context->'event'->>'detection', 'Match verified') AS detection,
+        to_char(woe.started_at, 'YYYY-MM-DD HH24:MI:SS') AS "receivedAt",
+        COALESCE(woe.duration_ms, 0)::int AS "totalTime",
+        woe.error_message AS error,
+        COALESCE(CAST(woe.context->'event'->>'weir_cpu_ms' AS NUMERIC), 0) AS weir_dur,
+        COALESCE(CAST(woe.context->'event'->>'screener_cpu_ms' AS NUMERIC), 0) AS screener_dur,
+        COALESCE(CAST(woe.context->'event'->>'ai_time_ms' AS NUMERIC), CAST(woe.context->'event'->>'inference_ms' AS NUMERIC), 0) AS infer_dur,
+        woe.duration_ms AS work_dur,
+        COALESCE(CAST(woe.context->>'cpu_us' AS NUMERIC), 0)::int AS "cpuUs",
+        COALESCE(CAST(woe.context->>'peak_rss' AS NUMERIC), 0)::bigint AS "peakRss",
+        COALESCE(CAST(woe.context->>'heap_used' AS NUMERIC), 0)::bigint AS "heapUsed",
+        COALESCE(CAST(woe.context->>'memory_before' AS NUMERIC), 0)::bigint AS "memBefore",
+        COALESCE(CAST(woe.context->>'memory_after' AS NUMERIC), 0)::bigint AS "memAfter"
+      FROM workflow_org_executions woe
+      JOIN workflow_catalog wc ON wc.id = woe.catalog_id
+      WHERE woe.id = $1
+    `, [req.params.frameId]);
+
+    if (!rows[0]) {
+      return res.status(404).json({ success: false, error: 'Frame not found' });
+    }
+
+    const f = rows[0];
+    const cpuUsToPercent = f.work_dur > 0 ? Math.round((f.cpuUs / 1000) / f.work_dur * 100) : 0;
+    const peakRssMb = f.peakRss > 0 ? Math.round(f.peakRss / (1024 * 1024)) : 0;
+
+    res.json({
+      frameId: f.frameId,
+      cameraId: f.cameraId,
+      pipeline: f.pipeline,
+      aiService: f.aiService,
+      workflow: f.workflow,
+      workerId: f.workerId,
+      confidence: f.confidence,
+      status: f.status,
+      detection: f.detection,
+      receivedAt: f.receivedAt,
+      totalTime: f.totalTime,
+      error: f.error,
+      events: [
+        { stage: 'Frame Received', duration: 0, cpu: '0%', memory: '0 B' },
+        { stage: 'FrameWeir.score()', duration: Math.round(Number(f.weir_dur)), cpu: Math.round(Number(f.weir_dur)) > 0 ? '12%' : '0%', memory: '~12 KB' },
+        { stage: 'FrameBus.publish()', duration: Math.round(Number(f.weir_dur)) > 0 ? 1 : 0, cpu: '1%', memory: '~1 KB' },
+        { stage: 'PerceptionGate.infer()', duration: Math.round(Number(f.infer_dur)) > 0 ? 2 : 0, cpu: Math.round(Number(f.infer_dur)) > 0 ? '4%' : '0%', memory: '~4 KB' },
+        { stage: 'SOMA.canAccept()', duration: Math.round(Number(f.weir_dur)) > 0 ? 1 : 0, cpu: '1%', memory: '~2 KB' },
+        { stage: 'PostgreSQL Queue', duration: 5, cpu: '0%', memory: '0 B' },
+        { stage: 'AI Inference', duration: Math.round(Number(f.infer_dur)), cpu: Math.round(Number(f.infer_dur)) > 0 ? '82%' : '0%', memory: f.aiService.toLowerCase().includes('mobile') ? '128 MB' : '64 MB' },
+        { stage: 'Decision Gate', duration: Math.round(Number(f.screener_dur)), cpu: Math.round(Number(f.screener_dur)) > 0 ? '15%' : '0%', memory: '~8 KB' },
+        { stage: 'Worker Execution', duration: Math.round(Number(f.work_dur)), cpu: cpuUsToPercent > 0 ? `${cpuUsToPercent}%` : '2%', memory: peakRssMb > 0 ? `${peakRssMb} MB` : '45 MB' },
+        { stage: 'Database Log', duration: 10, cpu: '5%', memory: '~4 KB' },
+        { stage: 'Completed', duration: 0, cpu: '0%', memory: '0 B' }
+      ]
+    });
+  } catch (err) {
+    res.status(500).json({ success: false, error: err.message });
+  }
+});
+
+// ── 4. Camera health ─────────────────────────────────────────────
+app.get('/api/camera/:cameraId', async (req, res) => {
+  try {
+    const { rows } = await pool.query(`
+      SELECT 
+        COUNT(*)::int AS received,
+        0::int AS skipped,
+        COUNT(*) FILTER (WHERE status = 'completed')::int AS completed,
+        COALESCE(ROUND(AVG(CAST(context->'event'->>'ai_time_ms' AS NUMERIC))), 0)::int AS avg_inference,
+        COALESCE(ROUND(AVG(duration_ms)), 0)::int AS avg_workflow
+      FROM workflow_org_executions
+      WHERE context->'event'->>'device_id' = $1 OR context->'event'->>'camera_id' = $1
+    `, [req.params.cameraId]);
+
+    const stat = rows[0] || { received: 0, skipped: 0, completed: 0, avg_inference: 0, avg_workflow: 0 };
+    res.json({
+      cameraId: req.params.cameraId,
+      received: stat.received,
+      skipped: stat.skipped,
+      completed: stat.completed,
+      avgInference: stat.avg_inference,
+      avgWorkflow: stat.avg_workflow,
+      failureRate: stat.received > 0 ? ((stat.received - stat.completed) / stat.received * 100).toFixed(1) + '%' : '0%'
+    });
+  } catch (err) {
+    res.status(500).json({ success: false, error: err.message });
+  }
+});
+
+// ── 5. Worker utilization ────────────────────────────────────────
+app.get('/api/workers', async (req, res) => {
+  try {
+    const telemetry = await getLiveStats();
+    const totalMem = telemetry?.system?.total_mem_bytes || os.totalmem();
+
+    const statsRes = await pool.query(`
+      SELECT 
+        COALESCE(context->'event'->>'worker_id', 'worker-1') AS name,
+        COUNT(*)::int AS jobs,
+        COALESCE(ROUND(AVG(duration_ms)), 0)::int AS time,
+        COALESCE(ROUND(AVG(CAST(context->>'cpu_us' AS NUMERIC))), 0)::int AS cpu_us,
+        COALESCE(ROUND(AVG(CAST(context->>'peak_rss' AS NUMERIC))), 0)::int AS peak_rss
+      FROM workflow_org_executions
+      GROUP BY COALESCE(context->'event'->>'worker_id', 'worker-1')
+    `);
+
+    const activeRes = await pool.query(`
+      SELECT 
+        COALESCE(executor_id, 'worker-1') AS name,
+        COUNT(*)::int AS active_count
+      FROM workflow_runner_queue
+      WHERE status = 'running'
+      GROUP BY COALESCE(executor_id, 'worker-1')
+    `);
+
+    const activeMap = new Map(activeRes.rows.map(r => [r.name, r.active_count]));
+    const backendCpu = telemetry?.cpu_usage_percent || 5;
+    const backendMemoryPct = telemetry?.memory?.pct || 12;
+
+    res.json(statsRes.rows.map(r => {
+      const activeJobs = activeMap.get(r.name) || 0;
+      const procCpuPercent = r.cpu_us > 0 && r.time > 0 ? Math.round((r.cpu_us / 1000) / r.time * 100) : 0;
+      const procMemPercent = r.peak_rss > 0 ? Math.round((r.peak_rss / totalMem) * 100) : 0;
+
+      const cpu = activeJobs > 0 
+        ? Math.min(95, Math.max(procCpuPercent, backendCpu, 20 + activeJobs * 10)) 
+        : Math.max(1, Math.round(backendCpu * 0.4));
+      const memory = activeJobs > 0 
+        ? Math.min(92, Math.max(procMemPercent, backendMemoryPct, 35 + activeJobs * 5)) 
+        : Math.max(1, backendMemoryPct);
+
+      return {
+        name: r.name,
+        jobs: r.jobs,
+        cpu,
+        memory,
+        queue: activeJobs,
+        time: r.time
+      };
+    }));
+  } catch (err) {
+    res.status(500).json({ success: false, error: err.message });
+  }
+});
+
+// ── 6. Pipeline execution logs ───────────────────────────────────
+app.get('/api/pipeline-logs', async (req, res) => {
+  try {
+    const days = req.query.days ? parseInt(req.query.days, 10) : null;
+    const limit = req.query.limit ? parseInt(req.query.limit, 10) : 25;
+
+    const queryParams = [];
+    let whereClause = '';
+    if (days && !isNaN(days)) {
+      queryParams.push(days);
+      whereClause = `WHERE woe.started_at >= NOW() - ($${queryParams.length} * INTERVAL '1 day')`;
+    }
+
+    queryParams.push(limit);
+    const limitPlaceholder = `$${queryParams.length}`;
+
+    const queryStr = `
+      SELECT 
+        woe.id::text AS id,
+        wc.name AS workflow_name,
+        COALESCE(woe.context->'event'->>'device_id', 'unknown') AS camera_id,
+        wc.name AS pipeline,
+        COALESCE(
+          NULLIF(NULLIF(woe.context->'event'->>'ai_service', 'unknown'), ''),
+          (
+            SELECT el->'data'->>'ai_service' 
+            FROM jsonb_array_elements(
+              CASE WHEN jsonb_typeof(wc.nodes_definition) = 'array' THEN wc.nodes_definition ELSE '[]'::jsonb END
+            ) AS el
+            WHERE el->>'type' = 'ai_node' 
+            LIMIT 1
+          ),
+          'unknown'
+        ) AS ai_service,
+        COALESCE(woe.context->'event'->>'worker_id', 'worker-1') AS worker_id,
+        COALESCE(
+          CAST(woe.context->'event'->>'confidence' AS NUMERIC),
+          (
+            SELECT CAST(val->'output'->>'confidence' AS NUMERIC)
+            FROM jsonb_each(
+              CASE WHEN jsonb_typeof(woe.context->'node_results') = 'object' THEN woe.context->'node_results' ELSE '{}'::jsonb END
+            ) AS t(key, val)
+            WHERE val->>'nodeType' = 'ai_node' AND val->'output'->>'confidence' IS NOT NULL
+            LIMIT 1
+          ),
+          0
+        )::float AS confidence,
+        woe.status AS status,
+        woe.error_message AS error,
+        COALESCE(CAST(woe.context->'event'->>'weir_cpu_ms' AS NUMERIC), 0)::int AS weir_dur,
+        COALESCE(CAST(woe.context->'event'->>'screener_cpu_ms' AS NUMERIC), 0)::int AS screener_dur,
+        COALESCE(
+          CAST(woe.context->'event'->>'ai_time_ms' AS NUMERIC),
+          CAST(woe.context->'event'->>'inference_ms' AS NUMERIC),
+          (
+            SELECT SUM(CAST(val->>'duration_ms' AS INT))
+            FROM jsonb_each(
+              CASE WHEN jsonb_typeof(woe.context->'node_results') = 'object' THEN woe.context->'node_results' ELSE '{}'::jsonb END
+            ) AS t(key, val)
+            WHERE val->>'nodeType' = 'ai_node'
+          ),
+          0
+        )::int AS ai_dur,
+        woe.duration_ms AS duration,
+        to_char(woe.started_at, 'YYYY-MM-DD HH24:MI:SS') AS timestamp
+      FROM workflow_org_executions woe
+      JOIN workflow_catalog wc ON wc.id = woe.catalog_id
+      ${whereClause}
+      ORDER BY woe.started_at DESC
+      LIMIT ${limitPlaceholder}
+    `;
+
+    const { rows } = await pool.query(queryStr, queryParams);
+
+    const logs = [];
+    rows.forEach(r => {
+      const execShort = r.id.substring(0, 8);
+      
+      logs.push({
+        id: `${r.id}_weir`,
+        timestamp: r.timestamp,
+        level: 'INFO',
+        layer: 'Weir Ingress',
+        message: `[${execShort}] [Weir Ingress] Frame received from camera '${r.camera_id}'. Motion detector processing time: ${r.weir_dur}ms.`
+      });
+
+      logs.push({
+        id: `${r.id}_screener`,
+        timestamp: r.timestamp,
+        level: 'INFO',
+        layer: 'Pre-Screener',
+        message: `[${execShort}] [Pre-Screener] Frame analysis initiated. Filter check screener CPU: ${r.screener_dur}ms.`
+      });
+
+      if (r.ai_dur > 0 || r.confidence > 0) {
+        logs.push({
+          id: `${r.id}_ai`,
+          timestamp: r.timestamp,
+          level: 'INFO',
+          layer: 'AI Inference',
+          message: `[${execShort}] [AI Inference] Dispatched to AI service '${r.ai_service}'. Inference time: ${r.ai_dur}ms. Object confidence: ${(r.confidence * 100).toFixed(1)}%.`
+        });
+      }
+
+      if (r.status === 'completed') {
+        logs.push({
+          id: `${r.id}_engine`,
+          timestamp: r.timestamp,
+          level: 'SUCCESS',
+          layer: 'Worker Engine',
+          message: `[${execShort}] [Worker Engine] Execution completed successfully on worker node '${r.worker_id}'. Workflow run time: ${r.duration}ms.`
+        });
+        logs.push({
+          id: `${r.id}_db`,
+          timestamp: r.timestamp,
+          level: 'SUCCESS',
+          layer: 'DB Logger',
+          message: `[${execShort}] [DB Logger] Successfully committed event record & metrics metadata to postgres database.`
+        });
+      } else if (r.status === 'failed') {
+        logs.push({
+          id: `${r.id}_error`,
+          timestamp: r.timestamp,
+          level: 'ERROR',
+          layer: 'Pipeline Error',
+          message: `[${execShort}] [Worker Engine] Execution crashed on worker node '${r.worker_id}'. Traceback Error: ${r.error || 'Runner execution timeout'}`
+        });
+      }
+    });
+
+    res.json(logs);
+  } catch (err) {
+    res.status(500).json({ success: false, error: err.message });
+  }
+});
+
+// ── 7. Telemetry & Debug settings GET ────────────────────────────
+app.get('/api/settings', async (req, res) => {
+  try {
+    const { rows } = await pool.query("SELECT value FROM configurations WHERE key = 'telemetry.settings'");
+    if (rows.length > 0) {
+      return res.json({ success: true, settings: rows[0].value });
+    }
+    res.json({
+      success: true,
+      settings: {
+        logLevel: 'INFO',
+        retention: '30',
+        alerts: true
+      }
+    });
+  } catch (err) {
+    res.status(500).json({ success: false, error: err.message });
+  }
+});
+
+// ── 7.1 Telemetry & Debug settings POST ──────────────────────────
+app.post('/api/settings', async (req, res) => {
+  try {
+    const settings = req.body;
+    if (!settings) {
+      return res.status(400).json({ success: false, error: 'Settings payload is required' });
+    }
+    
+    const valueStr = JSON.stringify(settings);
+    await pool.query(`
+      INSERT INTO configurations (key, value, category, is_active, updated_at)
+      VALUES ('telemetry.settings', $1, 'telemetry', true, NOW())
+      ON CONFLICT (key) DO UPDATE
+      SET value = EXCLUDED.value, updated_at = NOW()
+    `, [valueStr]);
+    
+    res.json({ success: true, settings });
+  } catch (err) {
+    res.status(500).json({ success: false, error: err.message });
+  }
+});
+
+// Cache storage for deep analysis endpoint
+let deepAnalysisCache = null;
+let deepAnalysisCacheTime = 0;
+const DEEP_ANALYSIS_CACHE_TTL = 60000; // 60 seconds
+
+// ── 8. Deep backend behavior analysis ────────────────────────────
+app.get('/api/deep-analysis', async (req, res) => {
+  try {
+    const now = Date.now();
+    if (deepAnalysisCache && (now - deepAnalysisCacheTime < DEEP_ANALYSIS_CACHE_TTL)) {
+      console.log('[Telemetry Backend] Serving deep-analysis from cache');
+      return res.json(deepAnalysisCache);
+    }
+
+    const telemetry = await getLiveStats();
+
+    // 1. Queries definitions
+    const modelProfileQuery = `
+      SELECT 
+        wc.name AS model_name,
+        COUNT(*)::int AS total_runs,
+        COALESCE(ROUND(AVG(CAST(woe.context->>'cpu_us' AS NUMERIC))), 0)::int AS avg_cpu_us,
+        COALESCE(ROUND(AVG(
+          CAST(woe.context->>'memory_after' AS NUMERIC) - CAST(woe.context->>'memory_before' AS NUMERIC)
+        )), 0)::bigint AS avg_mem_delta,
+        COALESCE(ROUND(AVG(CAST(woe.context->>'peak_rss' AS NUMERIC))), 0)::bigint AS avg_peak_rss,
+        COALESCE(ROUND(AVG(CAST(woe.context->>'heap_used' AS NUMERIC))), 0)::bigint AS avg_heap_used,
+        COALESCE(ROUND(AVG(woe.duration_ms)), 0)::int AS avg_duration_ms,
+        COUNT(*) FILTER (WHERE woe.status = 'completed')::int AS completed,
+        COUNT(*) FILTER (WHERE woe.status = 'failed')::int AS failed
+      FROM workflow_org_executions woe
+      JOIN workflow_catalog wc ON wc.id = woe.catalog_id
+      WHERE woe.started_at >= NOW() - INTERVAL '7 days'
+      GROUP BY wc.name
+      ORDER BY total_runs DESC
+    `;
+
+    const timelineQuery = `
+      SELECT 
+        to_char(date_trunc('minute', woe.started_at), 'YYYY-MM-DD HH24:MI:00') AS time_bucket,
+        COUNT(*)::int AS executions,
+        COALESCE(ROUND(AVG(CAST(woe.context->>'cpu_us' AS NUMERIC))), 0)::int AS avg_cpu_us,
+        COALESCE(ROUND(AVG(CAST(woe.context->>'peak_rss' AS NUMERIC) / (1024*1024))), 0)::int AS avg_peak_rss_mb,
+        COALESCE(ROUND(AVG(woe.duration_ms)), 0)::int AS avg_duration_ms
+      FROM workflow_org_executions woe
+      WHERE woe.started_at >= NOW() - INTERVAL '24 hours'
+      GROUP BY date_trunc('minute', woe.started_at)
+      ORDER BY date_trunc('minute', woe.started_at)
+    `;
+
+    const nodeBreakdownQuery = `
+      SELECT 
+        val->>'nodeType' AS node_type,
+        COUNT(*)::int AS total_executions,
+        COALESCE(ROUND(AVG(CAST(val->>'duration_ms' AS NUMERIC))), 0)::int AS avg_duration_ms,
+        COALESCE(ROUND(SUM(CAST(val->>'duration_ms' AS NUMERIC))), 0)::bigint AS total_time_ms
+      FROM workflow_org_executions woe,
+        LATERAL jsonb_each(
+          CASE WHEN jsonb_typeof(woe.context->'node_results') = 'object' THEN woe.context->'node_results' ELSE '{}'::jsonb END
+        ) AS t(key, val)
+      WHERE woe.started_at >= NOW() - INTERVAL '24 hours' AND val->>'nodeType' IS NOT NULL
+      GROUP BY val->>'nodeType'
+      ORDER BY total_time_ms DESC
+    `;
+
+    const cpuDistQuery = `
+      SELECT 
+        CASE
+          WHEN CAST(context->>'cpu_us' AS NUMERIC) < 100000 THEN '0-100ms'
+          WHEN CAST(context->>'cpu_us' AS NUMERIC) < 500000 THEN '100-500ms'
+          WHEN CAST(context->>'cpu_us' AS NUMERIC) < 1000000 THEN '500ms-1s'
+          WHEN CAST(context->>'cpu_us' AS NUMERIC) < 5000000 THEN '1-5s'
+          ELSE '5s+'
+        END AS cpu_bucket,
+        COUNT(*)::int AS count
+      FROM workflow_org_executions
+      WHERE started_at >= NOW() - INTERVAL '24 hours' AND context->>'cpu_us' IS NOT NULL
+      GROUP BY cpu_bucket
+      ORDER BY MIN(CAST(context->>'cpu_us' AS NUMERIC))
+    `;
+
+    const memDistQuery = `
+      SELECT 
+        CASE
+          WHEN CAST(context->>'peak_rss' AS NUMERIC) < 100*1024*1024 THEN '<100 MB'
+          WHEN CAST(context->>'peak_rss' AS NUMERIC) < 200*1024*1024 THEN '100-200 MB'
+          WHEN CAST(context->>'peak_rss' AS NUMERIC) < 500*1024*1024 THEN '200-500 MB'
+          WHEN CAST(context->>'peak_rss' AS NUMERIC) < 1024*1024*1024 THEN '500MB-1GB'
+          ELSE '1GB+'
+        END AS mem_bucket,
+        COUNT(*)::int AS count
+      FROM workflow_org_executions
+      WHERE started_at >= NOW() - INTERVAL '24 hours' AND context->>'peak_rss' IS NOT NULL
+      GROUP BY mem_bucket
+      ORDER BY MIN(CAST(context->>'peak_rss' AS NUMERIC))
+    `;
+
+    const heaviestQuery = `
+      SELECT 
+        woe.id::text AS id,
+        wc.name AS workflow_name,
+        woe.status,
+        COALESCE(CAST(woe.context->>'cpu_us' AS NUMERIC), 0)::int AS cpu_us,
+        COALESCE(CAST(woe.context->>'peak_rss' AS NUMERIC), 0)::bigint AS peak_rss,
+        COALESCE(CAST(woe.context->>'heap_used' AS NUMERIC), 0)::bigint AS heap_used,
+        COALESCE(woe.duration_ms, 0)::int AS duration_ms,
+        to_char(woe.started_at, 'YYYY-MM-DD HH24:MI:SS') AS started_at
+      FROM workflow_org_executions woe
+      JOIN workflow_catalog wc ON wc.id = woe.catalog_id
+      WHERE woe.started_at >= NOW() - INTERVAL '24 hours' AND woe.context->>'cpu_us' IS NOT NULL
+      ORDER BY CAST(woe.context->>'cpu_us' AS NUMERIC) DESC
+      LIMIT 10
+    `;
+
+    // 2. Execute all queries in parallel
+    const [
+      modelProfileRes,
+      timelineRes,
+      nodeBreakdownRes,
+      cpuDistRes,
+      memDistRes,
+      heaviestRes
+    ] = await Promise.all([
+      pool.query(modelProfileQuery),
+      pool.query(timelineQuery),
+      pool.query(nodeBreakdownQuery),
+      pool.query(cpuDistQuery),
+      pool.query(memDistQuery),
+      pool.query(heaviestQuery)
+    ]);
+
+    // 3. Map model profiles
+    const modelProfiles = modelProfileRes.rows.map(r => ({
+      name: r.model_name,
+      totalRuns: r.total_runs,
+      avgCpuUs: r.avg_cpu_us,
+      avgMemDelta: Number(r.avg_mem_delta),
+      avgPeakRss: Number(r.avg_peak_rss),
+      avgHeapUsed: Number(r.avg_heap_used),
+      avgDurationMs: r.avg_duration_ms,
+      completed: r.completed,
+      failed: r.failed,
+      cpuEfficiency: r.avg_duration_ms > 0 ? Math.round(r.avg_cpu_us / r.avg_duration_ms) : 0
+    }));
+
+    // 4. Map timeline
+    const resourceTimeline = timelineRes.rows.map(r => ({
+      time: r.time_bucket,
+      executions: r.executions,
+      avgCpuUs: r.avg_cpu_us,
+      avgPeakRssMb: r.avg_peak_rss_mb,
+      avgDurationMs: r.avg_duration_ms
+    }));
+
+    // 5. Map node breakdown
+    const nodeBreakdown = nodeBreakdownRes.rows.map(r => ({
+      nodeType: r.node_type,
+      totalExecutions: r.total_executions,
+      avgDurationMs: r.avg_duration_ms,
+      totalTimeMs: Number(r.total_time_ms)
+    }));
+
+    // 6. Map heaviest executions
+    const heaviestExecutions = heaviestRes.rows.map(r => ({
+      id: r.id,
+      workflowName: r.workflow_name,
+      status: r.status,
+      cpuUs: r.cpu_us,
+      peakRss: Number(r.peak_rss),
+      heapUsed: Number(r.heap_used),
+      durationMs: r.duration_ms,
+      startedAt: r.started_at
+    }));
+
+    const system = telemetry?.system || {};
+
+    const resultPayload = {
+      success: true,
+      system: {
+        cpuCores: system.cpu_cores || os.cpus().length,
+        cpuModel: system.cpu_model || os.cpus()[0]?.model?.trim() || 'Unknown',
+        totalMemBytes: system.total_mem_bytes || os.totalmem(),
+        freeMemBytes: system.free_mem_bytes || os.freemem(),
+        uptimeSeconds: telemetry?.uptime_seconds || 0,
+        processRssMb: Math.round((telemetry?.memory?.rss_bytes || 0) / (1024 * 1024)),
+        cpuUsagePercent: telemetry?.cpu_usage_percent || 0,
+        workerPoolSize: telemetry?.workers?.pool_size || 0,
+        workerBusyRatio: telemetry?.workers?.busy_ratio || 0,
+        queueDepth: telemetry?.workers?.queue_depth || 0
+      },
+      modelProfiles,
+      resourceTimeline,
+      nodeBreakdown,
+      cpuDistribution: cpuDistRes.rows.map(r => ({ bucket: r.cpu_bucket, count: r.count })),
+      memDistribution: memDistRes.rows.map(r => ({ bucket: r.mem_bucket, count: r.count })),
+      heaviestExecutions
+    };
+
+    // Cache the response
+    deepAnalysisCache = resultPayload;
+    deepAnalysisCacheTime = Date.now();
+
+    res.json(resultPayload);
+  } catch (err) {
+    console.error('[Telemetry Backend] deep-analysis error:', err.message);
+    res.status(500).json({ success: false, error: err.message });
+  }
+});
+
+// ── 9. Benchmark — frames per minute / day / week / month ─────────
 app.get('/api/benchmark', async (req, res) => {
   try {
     const minuteQuery = `
       SELECT
         to_char(date_trunc('minute', started_at), 'YYYY-MM-DD HH24:MI:00') AS time_bucket,
-        COUNT(*)::int AS executions
+        COUNT(*)::int AS frames
       FROM workflow_org_executions
       WHERE started_at IS NOT NULL AND started_at >= NOW() - INTERVAL '24 hours'
       GROUP BY date_trunc('minute', started_at)
@@ -406,7 +1107,7 @@ app.get('/api/benchmark', async (req, res) => {
     const dayQuery = `
       SELECT
         to_char(date_trunc('day', started_at), 'YYYY-MM-DD') AS time_bucket,
-        COUNT(*)::int AS executions
+        COUNT(*)::int AS frames
       FROM workflow_org_executions
       WHERE started_at IS NOT NULL AND started_at >= NOW() - INTERVAL '30 days'
       GROUP BY date_trunc('day', started_at)
@@ -416,7 +1117,7 @@ app.get('/api/benchmark', async (req, res) => {
     const weekQuery = `
       SELECT
         to_char(date_trunc('week', started_at), 'YYYY-MM-DD') AS time_bucket,
-        COUNT(*)::int AS executions
+        COUNT(*)::int AS frames
       FROM workflow_org_executions
       WHERE started_at IS NOT NULL AND started_at >= NOW() - INTERVAL '12 weeks'
       GROUP BY date_trunc('week', started_at)
@@ -426,58 +1127,18 @@ app.get('/api/benchmark', async (req, res) => {
     const monthQuery = `
       SELECT
         to_char(date_trunc('month', started_at), 'YYYY-MM') AS time_bucket,
-        COUNT(*)::int AS executions
+        COUNT(*)::int AS frames
       FROM workflow_org_executions
       WHERE started_at IS NOT NULL AND started_at >= NOW() - INTERVAL '12 months'
       GROUP BY date_trunc('month', started_at)
       ORDER BY date_trunc('month', started_at) ASC
     `;
 
-    const summaryQuery = `
-      SELECT
-        COUNT(*) FILTER (WHERE started_at >= NOW() - INTERVAL '24 hours')::int AS executions_24h,
-        COUNT(*) FILTER (WHERE started_at >= NOW() - INTERVAL '7 days')::int  AS executions_7d,
-        COUNT(*) FILTER (WHERE started_at >= NOW() - INTERVAL '30 days')::int AS executions_30d,
-        COUNT(*)::int AS executions_total
-      FROM workflow_org_executions
-      WHERE started_at IS NOT NULL
-    `;
-
-    const byWorkflowQuery = `
-      SELECT
-        wc.name AS workflow_name,
-        COUNT(*)::int AS executions
-      FROM workflow_org_executions woe
-      JOIN workflow_catalog wc ON wc.id = woe.catalog_id
-      WHERE woe.started_at >= NOW() - INTERVAL '30 days'
-      GROUP BY wc.name
-      ORDER BY executions DESC
-      LIMIT 10
-    `;
-
-    const recentQuery = `
-      SELECT
-        woe.id AS execution_id,
-        wc.name AS workflow_name,
-        woe.trigger_event,
-        woe.status,
-        woe.started_at,
-        woe.duration_ms
-      FROM workflow_org_executions woe
-      JOIN workflow_catalog wc ON wc.id = woe.catalog_id
-      WHERE woe.started_at IS NOT NULL
-      ORDER BY woe.started_at DESC
-      LIMIT 25
-    `;
-
-    const [perMinute, perDay, perWeek, perMonth, summary, byWorkflow, recent] = await Promise.all([
+    const [perMinute, perDay, perWeek, perMonth] = await Promise.all([
       pool.query(minuteQuery),
       pool.query(dayQuery),
       pool.query(weekQuery),
       pool.query(monthQuery),
-      pool.query(summaryQuery),
-      pool.query(byWorkflowQuery),
-      pool.query(recentQuery),
     ]);
 
     res.json({
@@ -486,50 +1147,55 @@ app.get('/api/benchmark', async (req, res) => {
       perDay: perDay.rows,
       perWeek: perWeek.rows,
       perMonth: perMonth.rows,
-      summary: summary.rows[0],
-      byWorkflow: byWorkflow.rows,
-      recent: recent.rows,
       generatedAt: new Date().toISOString(),
     });
   } catch (err) {
-    console.error('[Benchmark Backend] benchmark error:', err.message);
+    console.error('[Telemetry Backend] benchmark error:', err.message);
     res.status(500).json({ success: false, error: err.message });
   }
 });
 
-// ── Startup ───────────────────────────────────────────────────────
+// ── Startup ──────────────────────────────────────────────────────
 async function start() {
+  // Test DB connection
   try {
     await pool.query('SELECT 1');
-    console.log('[Benchmark Backend] PostgreSQL connected');
+    console.log('[Telemetry Backend] PostgreSQL connected directly');
   } catch (err) {
-    console.error('[Benchmark Backend] PostgreSQL connection failed:', err.message);
+    console.error('[Telemetry Backend] PostgreSQL connection failed:', err.message);
     process.exit(1);
   }
 
-  // Connect Redis in background (non-fatal if unavailable)
-  initRedis().catch(() => {});
+  // Connect Redis (non-blocking — dashboard still works without it)
+  await initRedis();
 
   const server = app.listen(PORT, '0.0.0.0', () => {
     console.log(`\n=============================================================`);
-    console.log(`  Benchmark Backend running on http://localhost:${PORT}`);
+    console.log(`  Telemetry Backend running on http://localhost:${PORT}`);
+    console.log(`  Mode: INDEPENDENT (Direct DB + Redis live stats)`);
     console.log(`=============================================================\n`);
   });
 
-  const shutdown = (signal) => {
-    console.log(`[Benchmark Backend] ${signal} received. Shutting down...`);
+  process.on('SIGTERM', () => {
+    console.log('[Telemetry Backend] SIGTERM received. Shutting down...');
     server.close(async () => {
       await pool.end();
-      try { if (redisClient) await redisClient.disconnect(); } catch (_) {}
+      if (redisClient) await redisClient.disconnect().catch(() => {});
       process.exit(0);
     });
-  };
+  });
 
-  process.on('SIGTERM', () => shutdown('SIGTERM'));
-  process.on('SIGINT', () => shutdown('SIGINT'));
+  process.on('SIGINT', () => {
+    console.log('[Telemetry Backend] SIGINT received. Shutting down...');
+    server.close(async () => {
+      await pool.end();
+      if (redisClient) await redisClient.disconnect().catch(() => {});
+      process.exit(0);
+    });
+  });
 }
 
 start().catch((err) => {
-  console.error('[Benchmark Backend] Fatal startup error:', err.message);
+  console.error('[Telemetry Backend] Fatal startup error:', err.message);
   process.exit(1);
 });
